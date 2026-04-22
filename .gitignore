@@ -1,0 +1,7 @@
+/target
+/Cargo.lock.bak
+.env
+.env.*
+*.pem
+*.key
+.splunk-cloud-credentials.toml

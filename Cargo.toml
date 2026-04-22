@@ -1,0 +1,50 @@
+[package]
+name = "splunk-cloud-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "CLI for Splunk Cloud Platform REST API (Victoria Experience)"
+repository = "https://github.com/hiboma/splunk-cloud-cli"
+readme = "README.md"
+
+[[bin]]
+name = "splunk-cloud-cli"
+path = "src/main.rs"
+
+[lib]
+name = "splunk_cloud_cli"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "signal",
+] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "1"
+thiserror = "2"
+urlencoding = "2"
+dirs = "6"
+
+[dev-dependencies]
+mockito = "1"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
