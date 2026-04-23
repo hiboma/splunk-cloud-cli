@@ -128,40 +128,16 @@ impl SplunkClient {
         } else {
             resp
         };
-        let status = resp.status();
-        let resp_headers = resp.headers().clone();
-        let text = resp.text().await?;
-        if self.debug {
-            eprintln!("[debug] <- {}", status);
-            for (name, value) in resp_headers.iter() {
-                eprintln!(
-                    "[debug]   {}: {}",
-                    name,
-                    value.to_str().unwrap_or("<binary>")
-                );
-            }
-            let mut preview = text.clone();
-            if preview.len() > 1024 {
-                preview.truncate(1024);
-                preview.push_str("...");
-            }
-            eprintln!("[debug]   body: {}", preview);
-        }
+        let (status, text) = self.drain_response(resp).await?;
         if status.is_server_error() {
-            let mut truncated = text.clone();
-            truncated.truncate(500);
-            return Err(SplunkError::Api(format!("{}: {}", status, truncated)));
+            return Err(api_error(status, &text));
         }
         let value = if text.is_empty() {
             Value::Null
         } else {
             match serde_json::from_str::<Value>(&text) {
                 Ok(v) => v,
-                Err(_) if !status.is_success() => {
-                    let mut truncated = text.clone();
-                    truncated.truncate(500);
-                    return Err(SplunkError::Api(format!("{}: {}", status, truncated)));
-                }
+                Err(_) if !status.is_success() => return Err(api_error(status, &text)),
                 Err(e) => return Err(SplunkError::Json(e)),
             }
         };
@@ -371,37 +347,52 @@ impl SplunkClient {
     }
 
     async fn handle_response(&self, resp: reqwest::Response) -> Result<Value> {
-        let status = resp.status();
-        let resp_headers = resp.headers().clone();
-        let text = resp.text().await?;
-
-        if self.debug {
-            eprintln!("[debug] <- {}", status);
-            for (name, value) in resp_headers.iter() {
-                eprintln!(
-                    "[debug]   {}: {}",
-                    name,
-                    value.to_str().unwrap_or("<binary>")
-                );
-            }
-            let mut preview = text.clone();
-            if preview.len() > 1024 {
-                preview.truncate(1024);
-                preview.push_str("...");
-            }
-            eprintln!("[debug]   body: {}", preview);
-        }
-
+        let (status, text) = self.drain_response(resp).await?;
         if !status.is_success() {
-            let mut truncated = text.clone();
-            truncated.truncate(500);
-            return Err(SplunkError::Api(format!("{}: {}", status, truncated)));
+            return Err(api_error(status, &text));
         }
         if text.is_empty() {
             return Ok(Value::Null);
         }
         Ok(serde_json::from_str(&text)?)
     }
+
+    /// レスポンスを読み尽くして `(status, body)` を返す。
+    /// `self.debug` 有効時はステータス・ヘッダ・本文プレビューを stderr に出す。
+    async fn drain_response(&self, resp: reqwest::Response) -> Result<(StatusCode, String)> {
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let text = resp.text().await?;
+        if self.debug {
+            eprintln!("[debug] <- {}", status);
+            for (name, value) in headers.iter() {
+                eprintln!(
+                    "[debug]   {}: {}",
+                    name,
+                    value.to_str().unwrap_or("<binary>")
+                );
+            }
+            let preview = preview_body(&text, 1024);
+            eprintln!("[debug]   body: {}", preview);
+        }
+        Ok((status, text))
+    }
+}
+
+/// debug 出力用に本文を一定バイト数で切り詰める。
+fn preview_body(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        text.to_string()
+    } else {
+        format!("{}...", &text[..limit])
+    }
+}
+
+/// 非 2xx 応答を `SplunkError::Api` に変換する共通ヘルパ。
+/// 本文は 500 バイトで打ち切る。
+fn api_error(status: StatusCode, text: &str) -> SplunkError {
+    let truncated = if text.len() > 500 { &text[..500] } else { text };
+    SplunkError::Api(format!("{}: {}", status, truncated))
 }
 
 #[derive(Debug, Clone)]
@@ -470,5 +461,28 @@ mod tests {
             c.ns_path(Some("admin"), Some("my_app"), "data/ui/views"),
             "/servicesNS/admin/my_app/data/ui/views"
         );
+    }
+
+    #[test]
+    fn preview_body_leaves_short_text_intact() {
+        assert_eq!(preview_body("hello", 1024), "hello");
+    }
+
+    #[test]
+    fn preview_body_truncates_long_text() {
+        let long: String = "x".repeat(2000);
+        let p = preview_body(&long, 1024);
+        assert_eq!(p.len(), 1024 + "...".len());
+        assert!(p.ends_with("..."));
+    }
+
+    #[test]
+    fn api_error_truncates_at_500_bytes() {
+        let long: String = "y".repeat(800);
+        let err = api_error(StatusCode::BAD_REQUEST, &long);
+        let msg = format!("{}", err);
+        assert!(msg.contains("400"));
+        assert!(msg.contains(&"y".repeat(500)));
+        assert!(!msg.contains(&"y".repeat(501)));
     }
 }
