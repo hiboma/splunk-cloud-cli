@@ -208,6 +208,35 @@ splunk-cloud-cli search results <SID>
 splunk-cloud-cli search control <SID> cancel
 ```
 
+#### Validate SPL syntax (no job is created)
+
+`search parse` calls `/services/search/parser` with `parse_only=true`. The parser inspects the SPL and returns either the parsed structure or `messages[].type = "FATAL"` — no search job is dispatched and no events are read. Useful in CI to gate saved-search / dashboard PRs.
+
+```bash
+# OK: prints parsed JSON, exit 0
+splunk-cloud-cli search parse --query 'index=_internal | stats count by sourcetype'
+
+# Syntax error: prints the FATAL message JSON, then a one-line error to stderr, exit 1
+splunk-cloud-cli search parse --query '| bizzbuzz foo'
+
+# Read SPL from a file or stdin
+splunk-cloud-cli search parse --query @./alert.spl
+cat alert.spl | splunk-cloud-cli search parse --query @-
+```
+
+Notes:
+
+- Splunk's `POST /services/search/jobs` does **not** support `exec_mode=parse`. Use this subcommand (which targets `/services/search/parser`) instead.
+- `--enable-lookups` resolves lookup tables during parsing (slower, but catches references to missing lookups).
+- `--reload-macros` forces a macro reload before parsing.
+- Pair with `-f json` for CI:
+
+  ```bash
+  if ! splunk-cloud-cli -f json search parse --query @./alert.spl > parsed.json 2> err.txt; then
+    cat err.txt && exit 1
+  fi
+  ```
+
 ### Saved Search
 
 ```bash
