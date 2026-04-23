@@ -1,0 +1,9 @@
+# Global owner for this repository.
+* @hiboma
+
+# Security-sensitive areas. Keep ownership explicit so future additions
+# to this file cannot accidentally drop coverage.
+/.github/        @hiboma
+/SECURITY.md     @hiboma
+/Cargo.toml      @hiboma
+/Cargo.lock      @hiboma
