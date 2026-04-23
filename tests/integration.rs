@@ -161,7 +161,10 @@ async fn post_form_allow_error_retries_once_on_401() {
 
     let client = SplunkClient::new(creds(&server.url())).unwrap();
     let (status, value) = client
-        .post_form_allow_error("/services/search/parser", &[("q", "search index=_internal")])
+        .post_form_allow_error(
+            "/services/search/parser",
+            &[("q", "search index=_internal")],
+        )
         .await
         .expect("retry should succeed");
     assert_eq!(status.as_u16(), 200);
@@ -194,12 +197,10 @@ async fn post_form_allow_error_returns_json_on_400() {
         .expect("4xx with JSON body should still return Ok");
     assert_eq!(status.as_u16(), 400);
     assert_eq!(value["messages"][0]["type"], "FATAL");
-    assert!(
-        value["messages"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("bizzbuzz")
-    );
+    assert!(value["messages"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("bizzbuzz"));
 }
 
 #[tokio::test]
