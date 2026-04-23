@@ -1188,6 +1188,7 @@ dependencies = [
  "clap_complete",
  "dirs",
  "futures-util",
+ "libc",
  "mockito",
  "reqwest",
  "serde",
