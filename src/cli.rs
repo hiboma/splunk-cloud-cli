@@ -22,6 +22,10 @@ Credentials are never accepted via command-line flags (which would leak through 
 They come from environment variables OR the config file at:\n\
   ./.splunk-cloud-cli.toml\n\
   $XDG_CONFIG_HOME/splunk-cloud-cli/config.toml  (default: ~/.config/splunk-cloud-cli/config.toml)\n\n\
+Secrets (token / session_key / password) can also live in the OS credential store\n\
+(macOS Keychain). Priority: env var > credential store > config file.\n\
+Use `splunk-cloud-cli credentials set <field>` to store a secret, or\n\
+`splunk-cloud-cli credentials migrate` to move secrets out of config.toml.\n\n\
 Environment variables always override the config file:\n\
   SPLUNK_BASE_URL        required (or `base_url`)\n\
   SPLUNK_TOKEN           one of these is required (or `token` / `session_key` /\n\
@@ -102,11 +106,72 @@ pub enum Command {
     #[command(subcommand)]
     Alert(AlertCmd),
 
+    /// Manage stored credentials (macOS Keychain).
+    ///
+    /// Secrets are stored in the login keychain under
+    /// `service="dev.splunk-cloud-cli"`. Inspect or delete via
+    /// Keychain Access.app or `security find-generic-password -s dev.splunk-cloud-cli`.
+    /// See README for the full credential resolution order and migration steps.
+    #[command(subcommand)]
+    Credentials(CredentialsCmd),
+
     /// Generate shell completion script.
     Completion {
         #[arg(value_enum)]
         shell: Shell,
     },
+}
+
+/// `credentials` サブコマンド。値は store の外へは出さない（`get` は用意しない）。
+#[derive(Subcommand, Debug)]
+pub enum CredentialsCmd {
+    /// Store a credential in the OS credential store (e.g. macOS Keychain).
+    Set {
+        #[arg(value_enum)]
+        field: CredentialField,
+        /// Read the value from stdin instead of prompting interactively.
+        /// Useful for CI / automation. The value must be a single line.
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Delete a credential from the OS credential store.
+    Delete {
+        #[arg(value_enum)]
+        field: CredentialField,
+    },
+    /// Show whether each credential is stored. Values are never printed.
+    Status,
+    /// Migrate `token` / `session_key` / `password` from config.toml into the OS credential store.
+    Migrate {
+        /// Show what would be done without modifying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// `credentials` が対象とする機密フィールドの列挙。
+///
+/// `username` / `base_url` は機密ではなく `config.toml` に置けばよいため対象外。
+#[derive(Copy, Clone, Debug, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum CredentialField {
+    /// Bearer token（`Authorization: Bearer <token>`）。
+    Token,
+    /// Splunk session key（`Authorization: Splunk <key>`）。
+    SessionKey,
+    /// Basic 認証パスワード。
+    Password,
+}
+
+impl CredentialField {
+    /// 対応する store 側のキー。`credential_store` 側の定数とそろえる。
+    pub fn key(self) -> &'static str {
+        match self {
+            CredentialField::Token => crate::config::credential_store::KEY_TOKEN,
+            CredentialField::SessionKey => crate::config::credential_store::KEY_SESSION_KEY,
+            CredentialField::Password => crate::config::credential_store::KEY_PASSWORD,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]

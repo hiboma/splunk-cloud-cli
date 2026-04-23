@@ -9,7 +9,10 @@ use serde_json::Value;
 /// - `output_mode=json` を自動付与する（GET/POST 双方）
 /// - `Authorization` ヘッダは `Authorizer` から取得する
 /// - 自己署名は受け付けない（`rustls-tls` の既定に従う）
-#[derive(Debug, Clone)]
+///
+/// `Debug` は派生しない。`auth` に session key が載るため、
+/// うっかり `{:?}` / `dbg!` で漏洩する経路を潰す。
+#[derive(Clone)]
 pub struct SplunkClient {
     http: reqwest::Client,
     base_url: String,

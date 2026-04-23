@@ -38,15 +38,22 @@ fn reset_sigpipe() {
 fn reset_sigpipe() {}
 
 async fn run(cli: Cli) -> Result<()> {
-    // `completion` does not touch credentials or config.
-    if let Command::Completion { shell } = &cli.command {
-        clap_complete::generate(
-            *shell,
-            &mut Cli::command(),
-            "splunk-cloud-cli",
-            &mut std::io::stdout(),
-        );
-        return Ok(());
+    // `completion` / `credentials` は Splunk への接続を必要としない（認証情報の
+    // 解決自体が目的のサブコマンドもあるため、ここで先に処理する）。
+    match &cli.command {
+        Command::Completion { shell } => {
+            clap_complete::generate(
+                *shell,
+                &mut Cli::command(),
+                "splunk-cloud-cli",
+                &mut std::io::stdout(),
+            );
+            return Ok(());
+        }
+        Command::Credentials(c) => {
+            return commands::credentials::run(c);
+        }
+        _ => {}
     }
 
     let settings = load_settings()?;
@@ -68,7 +75,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Federated(c) => commands::federated::run(c, &client, format).await,
         Command::Metrics(c) => commands::metrics::run(c, &client, format).await,
         Command::Alert(c) => commands::alert::run(c, &client, format).await,
-        Command::Completion { .. } => Err(SplunkError::Config(
+        Command::Completion { .. } | Command::Credentials(_) => Err(SplunkError::Config(
             "unreachable: handled above".to_string(),
         )),
     }

@@ -147,6 +147,11 @@ async fn http_on_non_loopback_is_rejected() {
         default_app: "search".into(),
         default_user: "nobody".into(),
     };
-    let err = SplunkClient::new(bad).expect_err("should reject");
+    // `SplunkClient` は Debug を派生しないため `expect_err` は使えない。
+    // `auth` に session key が載るので派生 Debug 経由の漏洩を防ぐための設計。
+    let err = match SplunkClient::new(bad) {
+        Ok(_) => panic!("should reject non-HTTPS, non-loopback base_url"),
+        Err(e) => e,
+    };
     assert!(format!("{}", err).contains("HTTPS"));
 }

@@ -1,0 +1,5 @@
+^checksum = "[0-9a-f]{64}"$
+^\*\.key$
+^\*\.pem$
+"pin-project-lite"
+"tower-service"
