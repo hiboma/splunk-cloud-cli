@@ -9,18 +9,16 @@ pub async fn run(cmd: &SearchCmd, client: &SplunkClient, format: OutputFormat) -
     match cmd {
         SearchCmd::Parse {
             query,
-            parse_only,
             enable_lookups,
             reload_macros,
         } => {
             let raw = read_data_arg(query)?;
             let spl = normalize_spl(&raw);
-            let parse_only_str = bool_str(*parse_only);
-            let enable_lookups_str = bool_str(*enable_lookups);
-            let reload_macros_str = bool_str(*reload_macros);
+            let enable_lookups_str = if *enable_lookups { "true" } else { "false" };
+            let reload_macros_str = if *reload_macros { "true" } else { "false" };
             let form: Vec<(&str, &str)> = vec![
                 ("q", spl.as_str()),
-                ("parse_only", parse_only_str),
+                ("parse_only", "true"),
                 ("enable_lookups", enable_lookups_str),
                 ("reload_macros", reload_macros_str),
             ];
@@ -144,14 +142,6 @@ fn normalize_spl(q: &str) -> String {
         q.to_string()
     } else {
         format!("search {}", q)
-    }
-}
-
-fn bool_str(b: bool) -> &'static str {
-    if b {
-        "true"
-    } else {
-        "false"
     }
 }
 

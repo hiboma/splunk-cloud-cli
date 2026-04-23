@@ -140,44 +140,32 @@ async fn api_error_is_surfaced() {
 }
 
 #[tokio::test]
-async fn search_parser_returns_messages_on_syntax_error() {
+async fn post_form_allow_error_retries_once_on_401() {
     let mut server = mockito::Server::new_async().await;
-    let body = r#"{"messages":[{"type":"FATAL","text":"Unknown search command 'bizzbuzz'."}]}"#;
-    let _m = server
+    let _first = server
         .mock("POST", "/services/search/parser")
-        .match_query(mockito::Matcher::UrlEncoded(
-            "output_mode".into(),
-            "json".into(),
-        ))
-        .match_body(mockito::Matcher::AllOf(vec![
-            mockito::Matcher::UrlEncoded("q".into(), "search bizzbuzz".into()),
-            mockito::Matcher::UrlEncoded("parse_only".into(), "true".into()),
-        ]))
+        .match_query(mockito::Matcher::Any)
+        .with_status(401)
+        .with_body(r#"{"messages":[{"type":"WARN","text":"unauthorized"}]}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let _second = server
+        .mock("POST", "/services/search/parser")
+        .match_query(mockito::Matcher::Any)
         .with_status(200)
-        .with_body(body)
+        .with_body(r#"{"messages":[]}"#)
+        .expect(1)
         .create_async()
         .await;
 
     let client = SplunkClient::new(creds(&server.url())).unwrap();
-    let value = client
-        .post_form(
-            "/services/search/parser",
-            &[
-                ("q", "search bizzbuzz"),
-                ("parse_only", "true"),
-                ("enable_lookups", "false"),
-                ("reload_macros", "false"),
-            ],
-        )
+    let (status, value) = client
+        .post_form_allow_error("/services/search/parser", &[("q", "search index=_internal")])
         .await
-        .unwrap();
-    assert_eq!(value["messages"][0]["type"], "FATAL");
-    assert!(
-        value["messages"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("bizzbuzz")
-    );
+        .expect("retry should succeed");
+    assert_eq!(status.as_u16(), 200);
+    assert_eq!(value["messages"], serde_json::json!([]));
 }
 
 #[tokio::test]
