@@ -7,12 +7,35 @@ use splunk_cloud_cli::error::{Result, SplunkError};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
+    reset_sigpipe();
     let cli = Cli::parse();
     if let Err(e) = run(cli).await {
         eprintln!("error: {}", e);
         std::process::exit(1);
     }
 }
+
+// Rust's runtime installs SIGPIPE as SIG_IGN, which turns writes to a
+// closed pipe into `ErrorKind::BrokenPipe` errors, which `println!`
+// reports as a panic. Restore the default disposition so `head`, `less`,
+// and similar tools terminate this process quietly — the customary
+// behavior for Unix filters.
+//
+// If a future change needs to handle SIGPIPE explicitly (e.g. enabling
+// tokio's `signal` feature and subscribing to `SignalKind::pipe`),
+// revisit this: tokio's signal driver installs its own handler and
+// would conflict with `SIG_DFL` here.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    // SAFETY: libc::signal is an FFI call; SIG_DFL restores the kernel
+    // default handler, which is defined and side-effect free.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
 
 async fn run(cli: Cli) -> Result<()> {
     // `completion` does not touch credentials or config.

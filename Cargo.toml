@@ -40,6 +40,9 @@ thiserror = "2"
 urlencoding = "2"
 dirs = "6"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 mockito = "1"
 
