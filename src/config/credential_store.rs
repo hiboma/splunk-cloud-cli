@@ -183,6 +183,39 @@ pub mod test_support {
             Ok(())
         }
     }
+
+    /// `get` が常に `Backend` エラーを返すテスト用スタブ。
+    /// Keychain アクセス拒否プロンプトに user が No を押したときの挙動を
+    /// 再現する。
+    pub struct FailingStore;
+
+    impl CredentialStore for FailingStore {
+        fn get(&self, _key: &str) -> Result<Option<String>, StoreError> {
+            Err(StoreError::Backend("simulated access denied".into()))
+        }
+        fn set(&self, _key: &str, _value: &str) -> Result<(), StoreError> {
+            Err(StoreError::Backend("simulated access denied".into()))
+        }
+        fn delete(&self, _key: &str) -> Result<(), StoreError> {
+            Err(StoreError::Backend("simulated access denied".into()))
+        }
+    }
+
+    /// `get` が常に `Unavailable` エラーを返すテスト用スタブ。
+    /// default keychain が無い環境（非 macOS、CI sandbox）の挙動を再現する。
+    pub struct UnavailableStore;
+
+    impl CredentialStore for UnavailableStore {
+        fn get(&self, _key: &str) -> Result<Option<String>, StoreError> {
+            Err(StoreError::Unavailable("no default keychain".into()))
+        }
+        fn set(&self, _key: &str, _value: &str) -> Result<(), StoreError> {
+            Err(StoreError::Unavailable("no default keychain".into()))
+        }
+        fn delete(&self, _key: &str) -> Result<(), StoreError> {
+            Err(StoreError::Unavailable("no default keychain".into()))
+        }
+    }
 }
 
 #[cfg(test)]

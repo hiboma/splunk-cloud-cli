@@ -609,4 +609,103 @@ format = "json"
             _ => panic!("expected Basic"),
         }
     }
+
+    #[test]
+    fn resolve_backend_error_refuses_toml_fallback() {
+        use super::credential_store::test_support::FailingStore;
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_splunk_env();
+        let store = FailingStore;
+        // TOML に token があっても、store が Backend エラーを返す限りは
+        // "no credential set" に倒して古い平文を拾わないこと。
+        let settings = Settings {
+            base_url: Some("https://x.splunkcloud.com:8089".into()),
+            token: Some("stale-toml-token".into()),
+            ..Settings::default()
+        };
+        let err = resolve_credentials_with_store(
+            None,
+            None,
+            &settings,
+            Some(&store as &dyn CredentialStore),
+        )
+        .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("no credential set"),
+            "expected fallback refusal, got: {}",
+            msg
+        );
+        assert!(!msg.contains("stale-toml-token"), "secret leaked: {}", msg);
+    }
+
+    #[test]
+    fn resolve_unavailable_store_falls_through_to_toml() {
+        use super::credential_store::test_support::UnavailableStore;
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_splunk_env();
+        let store = UnavailableStore;
+        let settings = Settings {
+            base_url: Some("https://x.splunkcloud.com:8089".into()),
+            token: Some("from-toml".into()),
+            ..Settings::default()
+        };
+        let creds = resolve_credentials_with_store(
+            None,
+            None,
+            &settings,
+            Some(&store as &dyn CredentialStore),
+        )
+        .unwrap();
+        match creds.auth {
+            AuthMethod::BearerToken(t) => assert_eq!(t, "from-toml"),
+            _ => panic!("expected BearerToken from toml"),
+        }
+    }
+
+    #[test]
+    fn resolve_empty_env_var_is_treated_as_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_splunk_env();
+        // Safety: テスト内でのみ使う。
+        unsafe {
+            std::env::set_var("SPLUNK_TOKEN", "");
+        }
+        let store = MemoryStore::new();
+        let settings = Settings {
+            base_url: Some("https://x.splunkcloud.com:8089".into()),
+            token: Some("from-toml".into()),
+            ..Settings::default()
+        };
+        let creds = resolve_credentials_with_store(
+            None,
+            None,
+            &settings,
+            Some(&store as &dyn CredentialStore),
+        )
+        .unwrap();
+        match creds.auth {
+            AuthMethod::BearerToken(t) => assert_eq!(t, "from-toml"),
+            _ => panic!("expected fallback to toml"),
+        }
+        // Safety: テスト内でのみ使う。
+        unsafe {
+            std::env::remove_var("SPLUNK_TOKEN");
+        }
+    }
+
+    #[test]
+    fn auth_method_debug_masks_session_key_and_basic_password() {
+        let sk = AuthMethod::SessionKey("LEAKED_SESSION_KEY".into());
+        let r = format!("{:?}", sk);
+        assert!(!r.contains("LEAKED_SESSION_KEY"), "session key leak: {}", r);
+
+        let basic = AuthMethod::Basic {
+            username: "alice".into(),
+            password: "LEAKED_PASSWORD".into(),
+        };
+        let r = format!("{:?}", basic);
+        assert!(!r.contains("LEAKED_PASSWORD"), "password leak: {}", r);
+        assert!(r.contains("alice"), "username should be visible: {}", r);
+    }
 }

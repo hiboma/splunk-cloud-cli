@@ -550,4 +550,74 @@ default_app = "search"
         let msg = format!("{}", err);
         assert!(msg.contains("open"), "unexpected error: {}", msg);
     }
+
+    // --- TOML 走査のエッジケース ---
+
+    #[test]
+    fn extract_handles_crlf_line_endings() {
+        // CRLF で値末尾に `\r` が紛れ込まないこと。閉じ引用符で切るので安全。
+        let s = "token = \"abc\"\r\nother = 1\r\n";
+        assert_eq!(
+            extract_field(s, "token"),
+            FieldScan::Present("abc".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_handles_inline_comment() {
+        // `token = "abc"  # comment` のような同行コメントも値だけを拾うこと。
+        let s = "token = \"abc\"  # actually the token\n";
+        assert_eq!(
+            extract_field(s, "token"),
+            FieldScan::Present("abc".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_ignores_commented_out_line() {
+        // 行頭が `#` で始まるコメントアウト行は未設定扱い。
+        // 行頭 trim 後に key で始まらないので、走査ループで自然に skip される。
+        let s = "# token = \"abc\"\n";
+        assert_eq!(extract_field(s, "token"), FieldScan::Absent);
+    }
+
+    #[test]
+    fn extract_handles_tab_separator() {
+        let s = "token\t=\t\"abc\"\n";
+        assert_eq!(
+            extract_field(s, "token"),
+            FieldScan::Present("abc".to_string())
+        );
+    }
+
+    #[test]
+    fn remove_strips_empty_basic_string_line() {
+        // `token = ""` のような空文字宣言行も migrate 対象として消えること。
+        // 空文字は FieldScan::Absent 扱いだが、remove_fields は値を問わず
+        // 該当キーの行を削除するので、migrate 後に宣言が残らない。
+        let s = "token = \"\"\npassword = \"pw\"\n";
+        let out = remove_fields(s, &["token", "password"]);
+        assert!(!out.contains("token"));
+        assert!(!out.contains("password"));
+    }
+
+    #[test]
+    fn remove_preserves_crlf_content() {
+        // 残る行は CRLF 固有の \r は保持されないが、出力は `\n` 改行に正規化される。
+        // これは書き換えの副作用として許容済み。テストは「指定キーの行だけ消える」
+        // 契約を確認する。
+        let s = "token = \"x\"\r\nother = 1\r\n";
+        let out = remove_fields(s, &["token"]);
+        assert!(out.contains("other = 1"));
+        assert!(!out.contains("token"));
+    }
+
+    #[test]
+    fn remove_keeps_commented_out_line() {
+        // コメントアウト行は「宣言」ではないので残す。
+        let s = "# token = \"x\"\nother = 1\n";
+        let out = remove_fields(s, &["token"]);
+        assert!(out.contains("# token = \"x\""));
+        assert!(out.contains("other = 1"));
+    }
 }
