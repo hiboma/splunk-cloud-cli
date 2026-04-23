@@ -26,9 +26,12 @@ pub async fn run(cmd: &SearchCmd, client: &SplunkClient, format: OutputFormat) -
                 .post_form_allow_error("/services/search/parser", &form)
                 .await?;
             print_value(&value, format)?;
+            // 構文エラー時、parser は messages[].type=FATAL を返す。
+            // 通常は HTTP 400 と FATAL が同時に来るが、片方だけでも失敗扱いにする。
             if let Some(msg) = first_fatal_message(&value) {
                 return Err(SplunkError::Api(format!("SPL parse error: {}", msg)));
             }
+            // セーフティネット: parser が FATAL を返さずに 4xx を返す未知応答の保険。
             if !status.is_success() {
                 return Err(SplunkError::Api(format!(
                     "SPL parse failed with HTTP {}",
