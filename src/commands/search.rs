@@ -1,11 +1,43 @@
 use crate::cli::{OutputFormat, SearchCmd};
 use crate::client::SplunkClient;
-use crate::error::Result;
+use crate::error::{Result, SplunkError};
 use crate::output::print_value;
-use crate::util::parse_kv_list;
+use crate::util::{parse_kv_list, read_data_arg};
+use serde_json::Value;
 
 pub async fn run(cmd: &SearchCmd, client: &SplunkClient, format: OutputFormat) -> Result<()> {
     match cmd {
+        SearchCmd::Parse {
+            query,
+            parse_only,
+            enable_lookups,
+            reload_macros,
+        } => {
+            let raw = read_data_arg(query)?;
+            let spl = normalize_spl(&raw);
+            let parse_only_str = bool_str(*parse_only);
+            let enable_lookups_str = bool_str(*enable_lookups);
+            let reload_macros_str = bool_str(*reload_macros);
+            let form: Vec<(&str, &str)> = vec![
+                ("q", spl.as_str()),
+                ("parse_only", parse_only_str),
+                ("enable_lookups", enable_lookups_str),
+                ("reload_macros", reload_macros_str),
+            ];
+            let (status, value) = client
+                .post_form_allow_error("/services/search/parser", &form)
+                .await?;
+            print_value(&value, format)?;
+            if let Some(msg) = first_fatal_message(&value) {
+                return Err(SplunkError::Api(format!("SPL parse error: {}", msg)));
+            }
+            if !status.is_success() {
+                return Err(SplunkError::Api(format!(
+                    "SPL parse failed with HTTP {}",
+                    status
+                )));
+            }
+        }
         SearchCmd::Run {
             query,
             earliest,
@@ -115,9 +147,35 @@ fn normalize_spl(q: &str) -> String {
     }
 }
 
+fn bool_str(b: bool) -> &'static str {
+    if b {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+/// `messages[]` の中から FATAL/ERROR を 1 件取り出して文字列化する。
+/// Splunk parser は構文エラーでも HTTP 200 を返すことがあるため必須。
+fn first_fatal_message(value: &Value) -> Option<String> {
+    let messages = value.get("messages")?.as_array()?;
+    for m in messages {
+        let ty = m.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if ty.eq_ignore_ascii_case("FATAL") || ty.eq_ignore_ascii_case("ERROR") {
+            let text = m
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no text)");
+            return Some(format!("[{}] {}", ty, text));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn normalize_adds_search_prefix() {
@@ -135,5 +193,37 @@ mod tests {
     #[test]
     fn normalize_keeps_pipe_command() {
         assert_eq!(normalize_spl("| tstats count"), "| tstats count");
+    }
+
+    #[test]
+    fn fatal_message_detected() {
+        let v = json!({
+            "messages": [
+                {"type": "FATAL", "text": "Unknown search command 'bizzbuzz'"}
+            ]
+        });
+        let m = first_fatal_message(&v).expect("should detect FATAL");
+        assert!(m.contains("FATAL"));
+        assert!(m.contains("bizzbuzz"));
+    }
+
+    #[test]
+    fn fatal_message_absent_on_clean_response() {
+        let v = json!({
+            "remoteSearch": "search index=_internal",
+            "messages": []
+        });
+        assert!(first_fatal_message(&v).is_none());
+    }
+
+    #[test]
+    fn fatal_message_ignores_info_level() {
+        let v = json!({
+            "messages": [
+                {"type": "INFO", "text": "ok"},
+                {"type": "WARN", "text": "deprecated syntax"}
+            ]
+        });
+        assert!(first_fatal_message(&v).is_none());
     }
 }

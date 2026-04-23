@@ -140,6 +140,102 @@ async fn api_error_is_surfaced() {
 }
 
 #[tokio::test]
+async fn search_parser_returns_messages_on_syntax_error() {
+    let mut server = mockito::Server::new_async().await;
+    let body = r#"{"messages":[{"type":"FATAL","text":"Unknown search command 'bizzbuzz'."}]}"#;
+    let _m = server
+        .mock("POST", "/services/search/parser")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "output_mode".into(),
+            "json".into(),
+        ))
+        .match_body(mockito::Matcher::AllOf(vec![
+            mockito::Matcher::UrlEncoded("q".into(), "search bizzbuzz".into()),
+            mockito::Matcher::UrlEncoded("parse_only".into(), "true".into()),
+        ]))
+        .with_status(200)
+        .with_body(body)
+        .create_async()
+        .await;
+
+    let client = SplunkClient::new(creds(&server.url())).unwrap();
+    let value = client
+        .post_form(
+            "/services/search/parser",
+            &[
+                ("q", "search bizzbuzz"),
+                ("parse_only", "true"),
+                ("enable_lookups", "false"),
+                ("reload_macros", "false"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(value["messages"][0]["type"], "FATAL");
+    assert!(
+        value["messages"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("bizzbuzz")
+    );
+}
+
+#[tokio::test]
+async fn post_form_allow_error_returns_json_on_400() {
+    let mut server = mockito::Server::new_async().await;
+    let body = r#"{"messages":[{"type":"FATAL","text":"Unknown search command 'bizzbuzz'."}]}"#;
+    let _m = server
+        .mock("POST", "/services/search/parser")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "output_mode".into(),
+            "json".into(),
+        ))
+        .with_status(400)
+        .with_header("content-type", "application/json")
+        .with_body(body)
+        .create_async()
+        .await;
+
+    let client = SplunkClient::new(creds(&server.url())).unwrap();
+    let (status, value) = client
+        .post_form_allow_error(
+            "/services/search/parser",
+            &[("q", "search | bizzbuzz"), ("parse_only", "true")],
+        )
+        .await
+        .expect("4xx with JSON body should still return Ok");
+    assert_eq!(status.as_u16(), 400);
+    assert_eq!(value["messages"][0]["type"], "FATAL");
+    assert!(
+        value["messages"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("bizzbuzz")
+    );
+}
+
+#[tokio::test]
+async fn post_form_allow_error_surfaces_500() {
+    let mut server = mockito::Server::new_async().await;
+    let _m = server
+        .mock("POST", "/services/search/parser")
+        .match_query(mockito::Matcher::Any)
+        .with_status(500)
+        .with_body("internal boom")
+        .create_async()
+        .await;
+
+    let client = SplunkClient::new(creds(&server.url())).unwrap();
+    let err = client
+        .post_form_allow_error("/services/search/parser", &[("q", "x")])
+        .await
+        .expect_err("5xx should be Err even with allow_error");
+    let msg = format!("{}", err);
+    assert!(msg.contains("500"), "got: {}", msg);
+    assert!(msg.contains("boom"), "got: {}", msg);
+}
+
+#[tokio::test]
 async fn http_on_non_loopback_is_rejected() {
     let bad = Credentials {
         base_url: "http://example.com".to_string(),

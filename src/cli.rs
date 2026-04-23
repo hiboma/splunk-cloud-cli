@@ -117,6 +117,24 @@ pub enum AuthCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum SearchCmd {
+    /// Validate SPL syntax via `/services/search/parser` (no job is created).
+    /// Exits non-zero when the parser returns a FATAL message.
+    Parse {
+        /// SPL query (a leading `search ` is added automatically when missing).
+        /// Accepts `@path` to read from a file, or `@-` to read from stdin.
+        #[arg(long)]
+        query: String,
+        /// Skip remote-search / normalized-search rendering and only check syntax.
+        #[arg(long, default_value_t = true)]
+        parse_only: bool,
+        /// Resolve lookup tables during parsing (slower; off by default).
+        #[arg(long)]
+        enable_lookups: bool,
+        /// Force a reload of macros before parsing.
+        #[arg(long)]
+        reload_macros: bool,
+    },
+
     /// Run SPL in oneshot mode and print the results.
     Run {
         /// SPL query (a leading `search ` is added automatically when missing).
