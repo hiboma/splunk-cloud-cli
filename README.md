@@ -64,7 +64,7 @@ Config file search order (first hit wins):
 base_url     = "https://prd-p-xxxxxx.splunkcloud.com:8089"
 
 # Pick exactly one auth method.
-token        = "eyJraWQi..."                # Bearer token (recommended)
+token        = "eyJEXAMPLEHEADER00.eyJEXAMPLEPAYLOAD0.EXAMPLESIGN0"   # Bearer token (recommended)
 # session_key = "..."                       # Splunk session key
 # username   = "admin"                      # Basic auth
 # password   = "..."
@@ -110,6 +110,75 @@ If the config file contains any of `token` / `session_key` / `password`, the CLI
 ```bash
 chmod 600 ~/.config/splunk-cloud-cli/config.toml
 ```
+
+### Credential storage (macOS Keychain)
+
+The secret fields — `token`, `session_key`, `password` — can live in the OS credential store instead of `config.toml`. Storing secrets in the Keychain keeps them out of plaintext config files (and out of dotfile backups, Time Machine snapshots, accidental git commits).
+
+Resolution order for each secret, highest priority first:
+
+1. Environment variable (`SPLUNK_TOKEN`, `SPLUNK_SESSION_KEY`, `SPLUNK_PASSWORD`)
+2. **macOS Keychain** (login keychain, `service=dev.splunk-cloud-cli`, `account=<field>`)
+3. `config.toml`
+
+If the Keychain itself reports a backend failure (e.g. the user denied an access prompt), the CLI refuses to fall back to `config.toml` and surfaces a "no credential set" error. Silently picking up a stale plaintext secret would defeat the point of moving the secret out of the toml in the first place. When the backend is simply unavailable (non-macOS build, CI sandbox without a default keychain), the fallback proceeds normally.
+
+#### Storing a secret
+
+```bash
+# Interactive prompt (input is hidden)
+splunk-cloud-cli credentials set token
+splunk-cloud-cli credentials set session-key
+splunk-cloud-cli credentials set password
+
+# Non-interactive (CI / scripts)
+echo "$SPLUNK_TOKEN" | splunk-cloud-cli credentials set token --stdin
+
+# Confirm presence (the value is never printed)
+splunk-cloud-cli credentials status
+```
+
+#### Migrating from config.toml
+
+To move any existing `token` / `session_key` / `password` out of `config.toml` and into the Keychain in one step:
+
+```bash
+splunk-cloud-cli credentials migrate
+```
+
+`migrate` is transactional: it writes to the Keychain first, then atomically rewrites `config.toml` (0600). If the rewrite fails, the Keychain entries it just wrote are rolled back so the user is never left in an inconsistent half-migrated state. Unsupported TOML quoting forms (literal strings, multi-line basic/literal, escaped quotes) are refused rather than silently mishandled.
+
+By default, `migrate` removes the plaintext lines from `config.toml` outright. Choosing to keep a 0600 backup is supported but warned about — any copy left on disk re-introduces the risk we just migrated away from.
+
+#### Inspecting the entries
+
+The entries live in your **login** keychain as `generic password` items:
+
+| Attribute | Value |
+|---|---|
+| Kind | `application password` |
+| Service (Name / Where) | `dev.splunk-cloud-cli` |
+| Account | `token` / `session_key` / `password` |
+
+```
+# GUI
+Keychain Access.app → login → Passwords → search "dev.splunk-cloud-cli"
+
+# CLI (metadata only; value is not printed)
+security find-generic-password -s dev.splunk-cloud-cli -a token
+```
+
+#### Removing an entry
+
+```bash
+splunk-cloud-cli credentials delete token
+# or via macOS:
+security delete-generic-password -s dev.splunk-cloud-cli -a token
+```
+
+#### Notes on Keychain prompts
+
+macOS shows an access-prompt dialog the first time the binary reads a Keychain entry. Choosing **Always Allow** suppresses subsequent prompts. The dialog reappears whenever the binary's code signature changes (e.g. after `cargo install` rebuilds the binary).
 
 ### Example: direnv `.envrc`
 

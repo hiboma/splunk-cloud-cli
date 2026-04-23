@@ -17,7 +17,7 @@
 ## セキュリティ hardening
 
 - 監査ログ出力（どの REST エンドポイントを叩いたか記録する仕組み）
-- `keyring` (macOS Keychain) 連携で token をセキュアに保存
+- `keyring` (macOS Keychain) 連携で token をセキュアに保存 — 実装済み（`credentials` サブコマンドで `token` / `session_key` / `password` を扱う）
 - `clear_env` は不要判定（子プロセス起動はないため、現状は漏洩経路なし）
 
 ## フェーズ 4 の積み残し
