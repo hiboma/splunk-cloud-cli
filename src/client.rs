@@ -103,6 +103,71 @@ impl SplunkClient {
             .await
     }
 
+    /// POST application/x-www-form-urlencoded。
+    /// 4xx でも JSON ボディが取れれば `(status, value)` を返す。
+    /// 5xx・タイムアウト・JSON パース失敗は通常通り `Err` を返す。
+    /// 構文エラーでも `messages[]` を返す `/services/search/parser` のような
+    /// エンドポイントを呼び出すために使う。
+    pub async fn post_form_allow_error(
+        &self,
+        path: &str,
+        form: &[(&str, &str)],
+    ) -> Result<(StatusCode, Value)> {
+        let owned: Vec<(String, String)> = form
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let url = format!("{}{}", self.base_url, path);
+        let body = Some(Body::Form(owned));
+        let resp = self
+            .send(Method::POST, &url, &[], body.clone(), false)
+            .await?;
+        let resp = if resp.status() == StatusCode::UNAUTHORIZED {
+            self.auth.invalidate().await;
+            self.send(Method::POST, &url, &[], body, true).await?
+        } else {
+            resp
+        };
+        let status = resp.status();
+        let resp_headers = resp.headers().clone();
+        let text = resp.text().await?;
+        if self.debug {
+            eprintln!("[debug] <- {}", status);
+            for (name, value) in resp_headers.iter() {
+                eprintln!(
+                    "[debug]   {}: {}",
+                    name,
+                    value.to_str().unwrap_or("<binary>")
+                );
+            }
+            let mut preview = text.clone();
+            if preview.len() > 1024 {
+                preview.truncate(1024);
+                preview.push_str("...");
+            }
+            eprintln!("[debug]   body: {}", preview);
+        }
+        if status.is_server_error() {
+            let mut truncated = text.clone();
+            truncated.truncate(500);
+            return Err(SplunkError::Api(format!("{}: {}", status, truncated)));
+        }
+        let value = if text.is_empty() {
+            Value::Null
+        } else {
+            match serde_json::from_str::<Value>(&text) {
+                Ok(v) => v,
+                Err(_) if !status.is_success() => {
+                    let mut truncated = text.clone();
+                    truncated.truncate(500);
+                    return Err(SplunkError::Api(format!("{}: {}", status, truncated)));
+                }
+                Err(e) => return Err(SplunkError::Json(e)),
+            }
+        };
+        Ok((status, value))
+    }
+
     /// POST application/x-www-form-urlencoded。`query` も付与する。
     #[allow(dead_code)]
     pub async fn post_form_with_query(
