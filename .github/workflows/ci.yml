@@ -77,3 +77,54 @@ jobs:
         with:
           tool: cargo-audit@0.22.1
       - run: cargo audit
+
+  actionlint:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: reviewdog/action-actionlint@6fb7acc99f4a1008869fa8a0f09cfca740837d9d # v1.72.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-pr-review
+
+  zizmor:
+    name: Analyze workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@eea29cff9a2b68892c0845ae3e4f45fc47ee9354 # v2.75.13
+        with:
+          tool: zizmor@1.24.0
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: zizmor --min-severity medium .
+
+  pinact:
+    name: Pin actions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install pinact
+        env:
+          PINACT_VERSION: 3.9.0
+          PINACT_SHA256: 3829da718de38b1e914b974c3e77045a256999af84789437a7305b09130d8a6a
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/suzuki-shunsuke/pinact/releases/download/v${PINACT_VERSION}/pinact_linux_amd64.tar.gz" -o pinact.tar.gz
+          echo "${PINACT_SHA256}  pinact.tar.gz" | sha256sum -c -
+          tar xf pinact.tar.gz pinact
+          sudo mv pinact /usr/local/bin/pinact
+      - name: Verify actions are pinned
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pinact run --verify --check
