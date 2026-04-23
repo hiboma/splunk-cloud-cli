@@ -228,19 +228,25 @@ fn read_secret_from_store(store: Option<&dyn CredentialStore>, key: &str) -> Sto
 
 /// 「env → Keychain → TOML」の優先順でフィールドを解決する。
 /// Backend エラーの場合のみ TOML へのフォールバックを拒否する。
+///
+/// 空文字はどのソースでも「未設定」として扱う。`SPLUNK_TOKEN=""` を
+/// そのまま `BearerToken("")` として採用してしまうと、ユーザーが何も設定
+/// していないつもりでも 401 に化ける UX バグになるため。
 fn resolve_secret(
     env_value: Option<String>,
     store: Option<&dyn CredentialStore>,
     key: &str,
     toml_value: Option<String>,
 ) -> Option<String> {
-    if env_value.is_some() {
-        return env_value;
+    if let Some(v) = env_value.filter(|s| !s.is_empty()) {
+        return Some(v);
     }
     match read_secret_from_store(store, key) {
-        StoreLookup::Found(v) => Some(v),
+        StoreLookup::Found(v) if !v.is_empty() => Some(v),
+        StoreLookup::Found(_) | StoreLookup::SkipFallthrough | StoreLookup::NotStored => {
+            toml_value.filter(|s| !s.is_empty())
+        }
         StoreLookup::BackendError => None,
-        StoreLookup::SkipFallthrough | StoreLookup::NotStored => toml_value,
     }
 }
 

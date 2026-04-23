@@ -44,12 +44,14 @@ fn set_value(store: &dyn CredentialStore, field: CredentialField, from_stdin: bo
     let value = if from_stdin {
         let mut buf = String::new();
         io::stdin().read_line(&mut buf)?;
-        // パスワードマネージャからのコピペで紛れ込んだ空白を丸ごと落とす。
-        let trimmed = buf.trim().to_string();
-        if trimmed.is_empty() {
+        // 行末の `\n` / `\r\n` だけを落とす。`trim()` で先頭/末尾の空白を
+        // 丸ごと削ると、前後スペースを含む正規の秘密値（稀だが）を静かに
+        // 破壊する。意図的な空白はユーザーの値として尊重する。
+        let stripped = buf.trim_end_matches(['\r', '\n']).to_string();
+        if stripped.is_empty() {
             return Err(SplunkError::Config("empty value from stdin".to_string()));
         }
-        trimmed
+        stripped
     } else {
         let prompt = format!("Enter {} (input hidden): ", field.key());
         rpassword::prompt_password(prompt)
@@ -180,17 +182,11 @@ fn migrate(store: &dyn CredentialStore, dry_run: bool) -> Result<()> {
     }
 
     // Step 2: 原本の処分方法を確認。既定は安全側（削除）。
-    // 実際に store に書き込んだフィールドだけを原本から消す。そうすれば
-    // 「store への書込はスキップしたのに行は消えた」状態を作らずに済む。
-    let toml_keys: Vec<&str> = present
-        .iter()
-        .map(|(k, _)| match *k {
-            KEY_TOKEN => "token",
-            KEY_SESSION_KEY => "session_key",
-            KEY_PASSWORD => "password",
-            other => other,
-        })
-        .collect();
+    // 3 つの秘密キーは値の有無を問わず一律で原本から消す。`token = ""` のような
+    // 空文字宣言行を残すと「秘密情報はどこにも書いてないはずなのに宣言だけ残る」
+    // という誤解を招き、`credentials status` との整合も崩れる。migrate の契約は
+    // 「config.toml からすべての秘密フィールドを除去する」と一貫させる。
+    let toml_keys: [&str; 3] = ["token", "session_key", "password"];
     let mode = prompt_disposal()?;
     let updated = remove_fields(&original, &toml_keys);
 

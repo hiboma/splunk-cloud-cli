@@ -9,12 +9,34 @@ use tokio::sync::RwLock;
 ///
 /// `BearerToken` / `SessionKey` はそのままヘッダを組み立てるが、
 /// `Basic` は `/services/auth/login` を叩いて得た session key をキャッシュする。
-#[derive(Debug, Clone)]
+///
+/// `Debug` は派生しない。`cached_session` には Splunk session key が載るため、
+/// `#[derive(Debug)]` で `Arc<RwLock<Option<String>>>` の Debug に委譲すると
+/// 値がそのまま展開される。`{:?}` / `dbg!` 経由の漏洩経路を潰すため手書きする。
+#[derive(Clone)]
 pub struct Authorizer {
     base_url: String,
     method: AuthMethod,
     cached_session: Arc<RwLock<Option<String>>>,
     http: reqwest::Client,
+}
+
+impl std::fmt::Debug for Authorizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `try_read` は非同期ランタイム外でも呼べる。取得失敗時でも値は展開しない。
+        let cached = match self.cached_session.try_read() {
+            Ok(guard) => match *guard {
+                Some(_) => "Some(***)",
+                None => "None",
+            },
+            Err(_) => "<locked>",
+        };
+        f.debug_struct("Authorizer")
+            .field("base_url", &self.base_url)
+            .field("method", &self.method)
+            .field("cached_session", &cached)
+            .finish()
+    }
 }
 
 impl Authorizer {
@@ -82,7 +104,11 @@ impl Authorizer {
     }
 }
 
-#[derive(Debug, Deserialize)]
+/// `/services/auth/login` のレスポンス body。
+///
+/// `Debug` は派生しない。`session_key` は長期有効な秘密値なので
+/// 派生 Debug 経由の `{:?}` でも絶対に展開させたくない。
+#[derive(Deserialize)]
 struct LoginResponse {
     #[serde(rename = "sessionKey")]
     session_key: String,
