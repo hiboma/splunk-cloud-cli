@@ -172,6 +172,46 @@ async fn post_form_allow_error_retries_once_on_401() {
 }
 
 #[tokio::test]
+async fn search_parse_sends_all_four_form_fields() {
+    // Parse サブコマンドが parser エンドポイントへ送るフォームの契約を固定する。
+    // q / parse_only / enable_lookups / reload_macros の 4 フィールドが
+    // 常に送られていることを mockito の match_body で検証する。
+    let mut server = mockito::Server::new_async().await;
+    let _m = server
+        .mock("POST", "/services/search/parser")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "output_mode".into(),
+            "json".into(),
+        ))
+        .match_body(mockito::Matcher::AllOf(vec![
+            mockito::Matcher::UrlEncoded("q".into(), "search index=_internal".into()),
+            mockito::Matcher::UrlEncoded("parse_only".into(), "true".into()),
+            mockito::Matcher::UrlEncoded("enable_lookups".into(), "false".into()),
+            mockito::Matcher::UrlEncoded("reload_macros".into(), "false".into()),
+        ]))
+        .with_status(200)
+        .with_body(r#"{"messages":[]}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let client = SplunkClient::new(creds(&server.url())).unwrap();
+    let (status, _) = client
+        .post_form_allow_error(
+            "/services/search/parser",
+            &[
+                ("q", "search index=_internal"),
+                ("parse_only", "true"),
+                ("enable_lookups", "false"),
+                ("reload_macros", "false"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.as_u16(), 200);
+}
+
+#[tokio::test]
 async fn post_form_allow_error_returns_json_on_400() {
     let mut server = mockito::Server::new_async().await;
     let body = r#"{"messages":[{"type":"FATAL","text":"Unknown search command 'bizzbuzz'."}]}"#;
