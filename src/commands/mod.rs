@@ -1,5 +1,6 @@
 pub mod alert;
 pub mod auth;
+pub mod credentials;
 pub mod dashboard;
 pub mod federated;
 pub mod knowledge;
