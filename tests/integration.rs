@@ -1,4 +1,6 @@
+use splunk_cloud_cli::cli::{IndexCmd, OutputFormat};
 use splunk_cloud_cli::client::SplunkClient;
+use splunk_cloud_cli::commands;
 use splunk_cloud_cli::config::{AuthMethod, Credentials};
 
 fn creds(server_url: &str) -> Credentials {
@@ -94,33 +96,94 @@ async fn saved_search_list_uses_ns_path() {
 }
 
 #[tokio::test]
-async fn index_ls_hits_data_indexes_with_summarize() {
-    // `index ls --summarize` が /services/data/indexes に
-    // count=0 と summarize=true を載せて GET することを固定する。
+async fn index_ls_summarize_sends_expected_query() {
+    // `commands::index::run` 経由で、 `index ls --summarize --count 25` が
+    // /services/data/indexes に count=25 と summarize=true を載せて
+    // GET することを固定する。
+    // mockito は match_query が一致しない場合 501 を返すので、
+    // ここでテストパスが 200 を得られれば契約が正しい。
     let mut server = mockito::Server::new_async().await;
-    let body = r#"{"entry":[{"name":"_internal","content":{"totalEventCount":"123"}}]}"#;
+    let body = r#"{"entry":[{"name":"_internal"}]}"#;
     let _m = server
         .mock("GET", "/services/data/indexes")
         .match_query(mockito::Matcher::AllOf(vec![
-            mockito::Matcher::UrlEncoded("count".into(), "0".into()),
+            mockito::Matcher::UrlEncoded("count".into(), "25".into()),
             mockito::Matcher::UrlEncoded("summarize".into(), "true".into()),
             mockito::Matcher::UrlEncoded("output_mode".into(), "json".into()),
         ]))
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(body)
+        .expect(1)
         .create_async()
         .await;
 
     let client = SplunkClient::new(creds(&server.url())).unwrap();
-    let value = client
-        .get(
-            "/services/data/indexes",
-            &[("count", "0"), ("summarize", "true")],
-        )
+    let cmd = IndexCmd::Ls {
+        count: 25,
+        summarize: true,
+    };
+    commands::index::run(&cmd, &client, OutputFormat::Json)
         .await
         .unwrap();
-    assert_eq!(value["entry"][0]["name"], "_internal");
+}
+
+#[tokio::test]
+async fn index_ls_without_summarize_omits_param() {
+    // `--summarize` 未指定のときは `summarize` クエリを一切載せない。
+    // "常に summarize=true を送る" という退行を防ぐ。
+    // regex crate は look-around 非対応なので、実装が常に送る
+    // count と output_mode のみが並ぶクエリ文字列を丸ごとマッチさせる
+    // ホワイトリスト方式で「他のキーが混ざらないこと」を固定する。
+    let mut server = mockito::Server::new_async().await;
+    let _m = server
+        .mock("GET", "/services/data/indexes")
+        .match_query(mockito::Matcher::Regex(
+            r"^count=0&output_mode=json$".into(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"entry":[]}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let client = SplunkClient::new(creds(&server.url())).unwrap();
+    let cmd = IndexCmd::Ls {
+        count: 0,
+        summarize: false,
+    };
+    commands::index::run(&cmd, &client, OutputFormat::Json)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn index_get_percent_encodes_name() {
+    // `index get "my/weird name"` は {name} を percent-encode して
+    // /services/data/indexes/my%2Fweird%20name へ GET することを固定する。
+    // path traversal / スペース / 予約文字のエスケープを検出する。
+    let mut server = mockito::Server::new_async().await;
+    let _m = server
+        .mock("GET", "/services/data/indexes/my%2Fweird%20name")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "output_mode".into(),
+            "json".into(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"entry":[{"name":"my/weird name"}]}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let client = SplunkClient::new(creds(&server.url())).unwrap();
+    let cmd = IndexCmd::Get {
+        name: "my/weird name".to_string(),
+    };
+    commands::index::run(&cmd, &client, OutputFormat::Json)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

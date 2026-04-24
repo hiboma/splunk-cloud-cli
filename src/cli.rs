@@ -525,9 +525,10 @@ pub enum IndexCmd {
     /// List data indexes (`/services/data/indexes`).
     #[command(name = "ls")]
     Ls {
-        /// Maximum entries to return. 0 means "all" per Splunkd REST conventions.
+        /// Maximum entries to return. Splunkd treats `count=0` as "all entries"
+        /// (see Splunk REST API common parameters), so 0 is the default here.
         #[arg(long, default_value_t = 0)]
-        count: i64,
+        count: u64,
         /// Return only summary fields (currentDBSizeMB / totalEventCount / minTime / maxTime).
         /// Maps to the Splunkd `summarize=true` query parameter.
         #[arg(long)]

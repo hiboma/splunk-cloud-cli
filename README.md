@@ -336,7 +336,7 @@ splunk-cloud-cli completion fish > ~/.config/fish/completions/splunk-cloud-cli.f
 
 ```bash
 cargo build
-cargo test      # 7 unit + 6 integration
+cargo test
 cargo build --release
 ```
 
