@@ -94,6 +94,36 @@ async fn saved_search_list_uses_ns_path() {
 }
 
 #[tokio::test]
+async fn index_ls_hits_data_indexes_with_summarize() {
+    // `index ls --summarize` が /services/data/indexes に
+    // count=0 と summarize=true を載せて GET することを固定する。
+    let mut server = mockito::Server::new_async().await;
+    let body = r#"{"entry":[{"name":"_internal","content":{"totalEventCount":"123"}}]}"#;
+    let _m = server
+        .mock("GET", "/services/data/indexes")
+        .match_query(mockito::Matcher::AllOf(vec![
+            mockito::Matcher::UrlEncoded("count".into(), "0".into()),
+            mockito::Matcher::UrlEncoded("summarize".into(), "true".into()),
+            mockito::Matcher::UrlEncoded("output_mode".into(), "json".into()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(body)
+        .create_async()
+        .await;
+
+    let client = SplunkClient::new(creds(&server.url())).unwrap();
+    let value = client
+        .get(
+            "/services/data/indexes",
+            &[("count", "0"), ("summarize", "true")],
+        )
+        .await
+        .unwrap();
+    assert_eq!(value["entry"][0]["name"], "_internal");
+}
+
+#[tokio::test]
 async fn kvstore_data_insert_sends_json() {
     let mut server = mockito::Server::new_async().await;
     let body = r#"{"_key":"abc"}"#;
