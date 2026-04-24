@@ -73,6 +73,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Kvstore(c) => commands::kvstore::run(c, &client, format).await,
         Command::Knowledge(c) => commands::knowledge::run(c, &client, format).await,
         Command::Federated(c) => commands::federated::run(c, &client, format).await,
+        Command::Index(c) => commands::index::run(c, &client, format).await,
         Command::Metrics(c) => commands::metrics::run(c, &client, format).await,
         Command::Alert(c) => commands::alert::run(c, &client, format).await,
         Command::Completion { .. } | Command::Credentials(_) => Err(SplunkError::Config(

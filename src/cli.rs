@@ -98,6 +98,10 @@ pub enum Command {
     #[command(subcommand)]
     Federated(FederatedCmd),
 
+    /// Data indexes (read-only; write belongs to ACS CLI).
+    #[command(subcommand)]
+    Index(IndexCmd),
+
     /// Metrics Catalog (metrics / dimensions / rollup).
     #[command(subcommand)]
     Metrics(MetricsCmd),
@@ -510,6 +514,27 @@ pub enum FederatedCmd {
 
     /// General federated search settings.
     Settings,
+}
+
+/// `index` (read-only) サブコマンド。
+///
+/// 書き込み系 (create / edit / remove) は README の方針どおり
+/// ACS CLI (`admin.splunk.com`) の担当であり、ここには実装しない。
+#[derive(Subcommand, Debug)]
+pub enum IndexCmd {
+    /// List data indexes (`/services/data/indexes`).
+    #[command(name = "ls")]
+    Ls {
+        /// Maximum entries to return. 0 means "all" per Splunkd REST conventions.
+        #[arg(long, default_value_t = 0)]
+        count: i64,
+        /// Return only summary fields (currentDBSizeMB / totalEventCount / minTime / maxTime).
+        /// Maps to the Splunkd `summarize=true` query parameter.
+        #[arg(long)]
+        summarize: bool,
+    },
+    /// Get a data index by name.
+    Get { name: String },
 }
 
 #[derive(Subcommand, Debug)]
