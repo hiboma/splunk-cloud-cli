@@ -293,6 +293,18 @@ splunk-cloud-cli federated index-ls
 splunk-cloud-cli federated settings
 ```
 
+### Indexes (read-only)
+
+Read-only inspection of `/services/data/indexes`. Creating, updating, or deleting indexes belongs to the [ACS CLI](https://help.splunk.com/en/splunk-cloud-platform/administer/admin-config-service-manual/); this CLI intentionally does not implement those operations.
+
+```bash
+splunk-cloud-cli index ls
+splunk-cloud-cli index ls --summarize
+splunk-cloud-cli index get _internal
+```
+
+`--summarize` switches to the Splunkd summary response (`currentDBSizeMB`, `totalEventCount`, `minTime`, `maxTime`), which is much smaller than the full index configuration payload.
+
 ### Metrics Catalog
 
 ```bash
@@ -324,7 +336,7 @@ splunk-cloud-cli completion fish > ~/.config/fish/completions/splunk-cloud-cli.f
 
 ```bash
 cargo build
-cargo test      # 7 unit + 6 integration
+cargo test
 cargo build --release
 ```
 

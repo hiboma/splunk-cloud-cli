@@ -3,6 +3,7 @@ pub mod auth;
 pub mod credentials;
 pub mod dashboard;
 pub mod federated;
+pub mod index;
 pub mod knowledge;
 pub mod kvstore;
 pub mod metrics;
