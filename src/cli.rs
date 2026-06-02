@@ -187,7 +187,13 @@ pub enum AuthCmd {
     ///
     /// Requires `oauth_tenant_id` / `oauth_client_id` in the config file
     /// (or `SPLUNK_OAUTH_TENANT_ID` / `SPLUNK_OAUTH_CLIENT_ID`).
-    Login,
+    Login {
+        /// Copy the one-time device code to the clipboard. The code is not a
+        /// secret (it is meant to be typed into the browser); only the code is
+        /// copied, never the access/refresh token. macOS only for now.
+        #[arg(long)]
+        copy: bool,
+    },
     /// Remove the stored OAuth access token, refresh token, and expiry.
     Logout,
     /// Show whether an OAuth token is stored and how long it remains valid.

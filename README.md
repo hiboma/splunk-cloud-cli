@@ -213,6 +213,10 @@ These three can also come from `SPLUNK_OAUTH_TENANT_ID` / `SPLUNK_OAUTH_CLIENT_I
 # Sign in. Shows a code, then opens the browser on Enter. Approve there.
 splunk-cloud-cli auth login
 
+# Same, but also copy the one-time code to the clipboard (macOS only).
+# Only the code is copied — never the access/refresh token.
+splunk-cloud-cli auth login --copy
+
 # Use the CLI as usual — the stored token is picked up automatically.
 splunk-cloud-cli auth whoami
 

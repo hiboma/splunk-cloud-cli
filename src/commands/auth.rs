@@ -19,7 +19,7 @@ pub async fn run(cmd: &AuthCmd, client: &SplunkClient, format: OutputFormat) -> 
         }
         // Login / Logout / Status は接続不要なため main 側で先に処理される。
         // ディスパッチの取りこぼしに気づけるよう明示的にエラーを返す。
-        AuthCmd::Login | AuthCmd::Logout | AuthCmd::Status => {
+        AuthCmd::Login { .. } | AuthCmd::Logout | AuthCmd::Status => {
             return Err(SplunkError::Config(
                 "internal: login/logout/status must be handled before client setup".to_string(),
             ));
@@ -40,7 +40,7 @@ pub async fn run_oauth(cmd: &AuthCmd, settings: &Settings) -> Result<()> {
     })?;
 
     match cmd {
-        AuthCmd::Login => login(settings, store.as_ref()).await,
+        AuthCmd::Login { copy } => login(settings, store.as_ref(), *copy).await,
         AuthCmd::Logout => logout(store.as_ref()),
         AuthCmd::Status => status(store.as_ref()),
         AuthCmd::Whoami => Err(SplunkError::Config(
@@ -49,7 +49,7 @@ pub async fn run_oauth(cmd: &AuthCmd, settings: &Settings) -> Result<()> {
     }
 }
 
-async fn login(settings: &Settings, store: &dyn CredentialStore) -> Result<()> {
+async fn login(settings: &Settings, store: &dyn CredentialStore, copy: bool) -> Result<()> {
     let cfg = resolve_oauth_config(settings)?;
     let http = reqwest::Client::builder()
         .user_agent(concat!("splunk-cloud-cli/", env!("CARGO_PKG_VERSION")))
@@ -64,6 +64,14 @@ async fn login(settings: &Settings, store: &dyn CredentialStore) -> Result<()> {
         eprintln!();
         eprintln!("    {}", emphasize_code(&p.user_code));
         eprintln!();
+
+        // `--copy` 指定時、user_code をクリップボードへ。user_code は秘密値では
+        // なく（ブラウザに手入力させる前提の表示用コード）、device_code / token は
+        // 決してコピーしない。
+        if copy && copy_to_clipboard(&p.user_code) {
+            eprintln!("(copied the code to the clipboard)");
+            eprintln!();
+        }
 
         // 対話端末では、まず code を確認させてから Enter でブラウザを開く。
         // 非対話（パイプ / CI）では Enter 待ちもブラウザ起動もせず、URL を
@@ -110,6 +118,48 @@ fn emphasize_code(code: &str) -> String {
         format!("\x1b[1;33m{}\x1b[0m", code)
     } else {
         code.to_string()
+    }
+}
+
+/// user_code をクリップボードへコピーする。コピーできたら true。
+///
+/// **コピーするのは user_code だけ**。user_code は秘密値ではない（ブラウザに
+/// 手入力させる前提の短い表示用コード）。device_code / access_token /
+/// refresh_token は秘密値であり、決してクリップボードへ置かない。
+///
+/// クリップボードは同一ユーザーの任意プロセスから読める共有資源のため、
+/// この不変条件（user_code のみ）を崩さないこと。
+///
+/// `pbcopy` は stdin から読むので、値を引数に置かない（`ps` 露出を避ける）。
+/// shell を介さず直接起動する。現状 macOS のみ対応。
+fn copy_to_clipboard(user_code: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let Ok(mut child) = Command::new("pbcopy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        // stdin に user_code を書き込む。改行は付けない（コードそのものだけ）。
+        if let Some(mut stdin) = child.stdin.take() {
+            if stdin.write_all(user_code.as_bytes()).is_err() {
+                return false;
+            }
+            // drop で stdin を閉じ、pbcopy に EOF を通知する。
+            drop(stdin);
+        }
+        matches!(child.wait(), Ok(s) if s.success())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = user_code;
+        false
     }
 }
 

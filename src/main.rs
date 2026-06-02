@@ -61,7 +61,9 @@ async fn run(cli: Cli) -> Result<()> {
     // `auth login` / `logout` / `status` は Splunk への接続を必要としない
     // （認証情報の取得・破棄・確認そのものが目的）。client を組む前に処理する。
     // `auth whoami` は接続が必要なので下のディスパッチに任せる。
-    if let Command::Auth(c @ (AuthCmd::Login | AuthCmd::Logout | AuthCmd::Status)) = &cli.command {
+    if let Command::Auth(c @ (AuthCmd::Login { .. } | AuthCmd::Logout | AuthCmd::Status)) =
+        &cli.command
+    {
         return commands::auth::run_oauth(c, &settings).await;
     }
 
