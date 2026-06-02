@@ -191,7 +191,9 @@ macOS shows an access-prompt dialog the first time the binary reads a Keychain e
 
 ### Sign in with Entra ID (OAuth device code flow)
 
-Instead of pasting a long-lived token, you can sign in interactively against Microsoft Entra ID. The CLI runs the OAuth 2.0 **device code flow**: it shows a short one-time code, then (on a terminal) waits for you to press Enter and opens the sign-in page in your browser; you enter the code and approve. The CLI stores the resulting JWT access token (plus a refresh token) in the OS credential store. Splunk Cloud is configured to validate that JWT as a Bearer token — the CLI never sees your password.
+Instead of pasting a long-lived token, you can sign in interactively against Microsoft Entra ID. The CLI runs the OAuth 2.0 **device code flow**: it shows a short one-time code, then (on a terminal) waits for you to press Enter and opens the sign-in page in your browser; you enter the code and approve. The CLI never sees your password.
+
+Splunk Cloud does **not** accept the Entra ID JWT directly on the REST API — it issues its own tokens. So after the device code flow, the CLI exchanges the Entra JWT for a Splunk access token via the Splunk token endpoint (`oauth2/v1/token`, using the JWT as a `client_assertion`), and stores that Splunk token. Subsequent REST calls send the Splunk token as a Bearer token.
 
 When stdout/stdin are not a terminal (piped or CI), the CLI does not wait or open a browser: it prints the URL and code and proceeds to poll, so scripts don't block.
 
@@ -223,21 +225,26 @@ splunk-cloud-cli auth whoami
 # Inspect token state (the value itself is never printed).
 splunk-cloud-cli auth status
 
-# Sign out (removes the access token, refresh token, and expiry).
+# Sign out (removes the stored OAuth session).
 splunk-cloud-cli auth logout
 ```
 
-The access token typically expires after ~1 hour. When it is close to expiry, the CLI uses the stored refresh token to obtain a new one automatically and writes the result back to the credential store — no re-login needed until the refresh token itself expires. If the refresh fails (revoked or expired), run `auth login` again.
+The Splunk token typically expires after ~1 hour. When it is close to expiry, the CLI refreshes it automatically and writes the result back — no re-login needed until the Entra refresh token itself expires. The refresh is staged:
+
+1. Splunk token valid → used as-is.
+2. Splunk token expired, Entra access token still valid → re-exchange the Entra token for a fresh Splunk token.
+3. Both expired → use the Entra refresh token to get a new Entra access token, then re-exchange.
+
+If all of these fail (e.g. the refresh token was revoked), run `auth login` again.
 
 Storage layout in the credential store (`service=dev.splunk-cloud-cli`):
 
 | Account | Contents |
 |---|---|
-| `token` | OAuth access token (shared with the manually-set Bearer token slot) |
-| `refresh_token` | OAuth refresh token (long-lived secret) |
-| `token_expiry` | Access token expiry as a UNIX timestamp |
+| `oauth_session` | A single JSON entry holding the Splunk token, Entra access token, Entra refresh token, and both expiries |
+| `token` | Reserved for a manually-set Bearer token (`credentials set token`); not used by `auth login` |
 
-Because the access token is stored in the same `token` slot as a manually-set Bearer token, every other subcommand works unchanged after `auth login`. Automatic refresh only kicks in when a refresh token and expiry are present and `SPLUNK_TOKEN` is **not** set in the environment (an explicit `SPLUNK_TOKEN` is treated as a fixed value and never overwritten).
+The five OAuth values are kept in **one** `oauth_session` entry rather than separate keys, so macOS only shows the Keychain access prompt once instead of per value. Credential resolution order: `SPLUNK_TOKEN` env var → OAuth session (`auth login`) → manual `token` → `session_key` → Basic auth. An explicit `SPLUNK_TOKEN` is treated as a fixed value and disables automatic refresh.
 
 ### Example: direnv `.envrc`
 
