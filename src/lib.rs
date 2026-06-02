@@ -7,5 +7,6 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod error;
+pub mod oauth;
 pub mod output;
 pub mod util;

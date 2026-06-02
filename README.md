@@ -69,6 +69,12 @@ token        = "eyJEXAMPLEHEADER00.eyJEXAMPLEPAYLOAD0.EXAMPLESIGN0"   # Bearer t
 # username   = "admin"                      # Basic auth
 # password   = "..."
 
+# Or sign in interactively with `auth login` (Entra ID device code flow).
+# These identifiers are not secrets. See "Sign in with Entra ID" below.
+# oauth_tenant_id = "a271068e-1b87-40f0-a7f2-f9c9624e3f7c"
+# oauth_client_id = "325df464-153b-4bc5-adac-7e5014b58bb4"
+# oauth_scope     = "api://325df464-153b-4bc5-adac-7e5014b58bb4/user_impersonation"
+
 default_app  = "search"                     # servicesNS default app
 default_user = "nobody"                     # servicesNS default user
 format       = "pretty"                     # pretty | json | yaml | csv
@@ -86,6 +92,9 @@ Any TOML field that is a secret (or the stack URL) can be overridden via env. Pr
 | `SPLUNK_USERNAME` / `SPLUNK_PASSWORD` | `username` / `password` |
 | `SPLUNK_APP` | `default_app` |
 | `SPLUNK_USER` | `default_user` |
+| `SPLUNK_OAUTH_TENANT_ID` | `oauth_tenant_id` |
+| `SPLUNK_OAUTH_CLIENT_ID` | `oauth_client_id` |
+| `SPLUNK_OAUTH_SCOPE` | `oauth_scope` |
 
 Per-field resolution: CLI flag (where present) → environment variable → config file → built-in default.
 
@@ -179,6 +188,63 @@ security delete-generic-password -s dev.splunk-cloud-cli -a token
 #### Notes on Keychain prompts
 
 macOS shows an access-prompt dialog the first time the binary reads a Keychain entry. Choosing **Always Allow** suppresses subsequent prompts. The dialog reappears whenever the binary's code signature changes (e.g. after `cargo install` rebuilds the binary).
+
+### Sign in with Entra ID (OAuth device code flow)
+
+Instead of pasting a long-lived token, you can sign in interactively against Microsoft Entra ID. The CLI runs the OAuth 2.0 **device code flow**: it shows a short one-time code, then (on a terminal) waits for you to press Enter and opens the sign-in page in your browser; you enter the code and approve. The CLI never sees your password.
+
+Splunk Cloud does **not** accept the Entra ID JWT directly on the REST API — it issues its own tokens. So after the device code flow, the CLI exchanges the Entra JWT for a Splunk access token via the Splunk token endpoint (`oauth2/v1/token`, using the JWT as a `client_assertion`), and stores that Splunk token. Subsequent REST calls send the Splunk token as a Bearer token.
+
+When stdout/stdin are not a terminal (piped or CI), the CLI does not wait or open a browser: it prints the URL and code and proceeds to poll, so scripts don't block.
+
+This requires an Entra ID app registration with a public client (device code) enabled, and a matching OAuth 2.0 configuration on the Splunk Cloud side. Put the (non-secret) tenant and client identifiers in the config file:
+
+```toml
+base_url        = "https://prd-p-xxxxxx.splunkcloud.com:8089"
+
+# Entra ID OAuth (used by `auth login`)
+oauth_tenant_id = "a271068e-1b87-40f0-a7f2-f9c9624e3f7c"
+oauth_client_id = "325df464-153b-4bc5-adac-7e5014b58bb4"
+# oauth_scope   = "api://325df464-153b-4bc5-adac-7e5014b58bb4/user_impersonation"
+# ^ optional; defaults to api://<client_id>/user_impersonation. `offline_access` is always added.
+```
+
+These three can also come from `SPLUNK_OAUTH_TENANT_ID` / `SPLUNK_OAUTH_CLIENT_ID` / `SPLUNK_OAUTH_SCOPE`. They are not secrets, so unlike the auth fields they may live in the config file or env without special handling.
+
+```bash
+# Sign in. Shows a code, then opens the browser on Enter. Approve there.
+splunk-cloud-cli auth login
+
+# Same, but also copy the one-time code to the clipboard (macOS only).
+# Only the code is copied — never the access/refresh token.
+splunk-cloud-cli auth login --copy
+
+# Use the CLI as usual — the stored token is picked up automatically.
+splunk-cloud-cli auth whoami
+
+# Inspect token state (the value itself is never printed).
+splunk-cloud-cli auth status
+
+# Sign out (removes the stored OAuth session).
+splunk-cloud-cli auth logout
+```
+
+The Splunk token typically expires after ~1 hour. When it is close to expiry, the CLI refreshes it automatically and writes the result back — no re-login needed until the Entra refresh token itself expires. The refresh is staged:
+
+1. Splunk token valid → used as-is.
+2. Splunk token expired, Entra access token still valid → re-exchange the Entra token for a fresh Splunk token.
+3. Both expired → use the Entra refresh token to get a new Entra access token, then re-exchange.
+
+If all of these fail (e.g. the refresh token was revoked), run `auth login` again.
+
+Storage layout in the credential store (`service=dev.splunk-cloud-cli`):
+
+| Account | Contents |
+|---|---|
+| `oauth_session` | A single JSON entry holding the Splunk token, Entra access token, Entra refresh token, and both expiries |
+| `token` | Reserved for a manually-set Bearer token (`credentials set token`); not used by `auth login` |
+
+The five OAuth values are kept in **one** `oauth_session` entry rather than separate keys, so macOS only shows the Keychain access prompt once instead of per value. Credential resolution order: `SPLUNK_TOKEN` env var → OAuth session (`auth login`) → manual `token` → `session_key` → Basic auth. An explicit `SPLUNK_TOKEN` is treated as a fixed value and disables automatic refresh.
 
 ### Example: direnv `.envrc`
 

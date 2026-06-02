@@ -15,13 +15,24 @@ use std::fmt;
 pub const SERVICE: &str = "dev.splunk-cloud-cli";
 
 /// Bearer token を格納するエントリのキー。
+/// `credentials set token` で手動投入した Bearer token を保持する。
+/// （OAuth ログインで得たトークンは `oauth_session` 側に集約する。）
 pub const KEY_TOKEN: &str = "token";
 /// Splunk session key を格納するエントリのキー。
 pub const KEY_SESSION_KEY: &str = "session_key";
 /// Basic 認証用パスワードを格納するエントリのキー。
 pub const KEY_PASSWORD: &str = "password";
+/// `auth login` の OAuth セッション一式（JSON）を格納する単一エントリのキー。
+///
+/// Splunk token / その失効時刻 / Entra access token / その失効時刻 / Entra
+/// refresh token を 1 つの JSON 値にまとめて保存する。複数エントリに分けると
+/// macOS Keychain のアクセス許可ダイアログが値ごとに出て煩雑になるため、
+/// 1 エントリに集約して読み書きを 1 回のアクセスにまとめる。
+pub const KEY_OAUTH_SESSION: &str = "oauth_session";
 
-/// 既知のキー一覧。`status` / テスト / 逐次走査で使う。
+/// `credentials` サブコマンドが set/delete/status で扱う 3 フィールド。
+/// OAuth セッション（`oauth_session`）は `auth login` / `auth logout` が
+/// 管理するため、ここには含めない。
 pub const KNOWN_KEYS: &[&str] = &[KEY_TOKEN, KEY_SESSION_KEY, KEY_PASSWORD];
 
 #[derive(Debug)]
@@ -49,7 +60,7 @@ impl std::error::Error for StoreError {}
 /// `get` はエントリが存在しない通常状態を `Ok(None)` で返す。
 /// バックエンド起因の失敗は `Err` として伝播させ、
 /// 呼び出し側が「未保存」と「到達不能」を区別できるようにする。
-pub trait CredentialStore {
+pub trait CredentialStore: Send + Sync {
     fn get(&self, key: &str) -> Result<Option<String>, StoreError>;
     fn set(&self, key: &str, value: &str) -> Result<(), StoreError>;
     fn delete(&self, key: &str) -> Result<(), StoreError>;

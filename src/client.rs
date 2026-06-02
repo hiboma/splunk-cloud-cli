@@ -210,8 +210,8 @@ impl SplunkClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let mut body = resp.text().await.unwrap_or_default();
-            body.truncate(500);
+            let body = resp.text().await.unwrap_or_default();
+            let body = crate::util::truncate_chars(&body, 500);
             return Err(SplunkError::Api(format!("{}: {}", status, body)));
         }
 
@@ -338,11 +338,12 @@ impl SplunkClient {
                     eprintln!("{}   form body: {}", tag, preview);
                 }
                 Body::Json(json) => {
-                    let mut s = serde_json::to_string(json).unwrap_or_default();
-                    if s.len() > 500 {
-                        s.truncate(500);
-                        s.push_str("...");
-                    }
+                    let s = serde_json::to_string(json).unwrap_or_default();
+                    let s = if s.chars().count() > 500 {
+                        format!("{}...", crate::util::truncate_chars(&s, 500))
+                    } else {
+                        s
+                    };
                     eprintln!("{}   json body: {}", tag, s);
                 }
             }
@@ -408,8 +409,8 @@ enum Body {
 async fn handle_bytes(resp: reqwest::Response) -> Result<Vec<u8>> {
     let status = resp.status();
     if !status.is_success() {
-        let mut body = resp.text().await.unwrap_or_default();
-        body.truncate(500);
+        let body = resp.text().await.unwrap_or_default();
+        let body = crate::util::truncate_chars(&body, 500);
         return Err(SplunkError::Api(format!("{}: {}", status, body)));
     }
     Ok(resp.bytes().await?.to_vec())
@@ -426,6 +427,7 @@ mod tests {
             auth: AuthMethod::BearerToken("dummy".to_string()),
             default_app: default_app.to_string(),
             default_user: default_user.to_string(),
+            oauth: None,
         };
         SplunkClient::new(creds).unwrap()
     }

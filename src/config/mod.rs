@@ -7,7 +7,8 @@ use crate::error::{Result, SplunkError};
 pub mod credential_store;
 
 use credential_store::{
-    default_store, CredentialStore, StoreError, KEY_PASSWORD, KEY_SESSION_KEY, KEY_TOKEN,
+    default_store, CredentialStore, StoreError, KEY_OAUTH_SESSION, KEY_PASSWORD, KEY_SESSION_KEY,
+    KEY_TOKEN,
 };
 
 /// Splunk Cloud への接続に必要な資格情報一式。
@@ -17,6 +18,31 @@ pub struct Credentials {
     pub auth: AuthMethod,
     pub default_app: String,
     pub default_user: String,
+    /// `auth login` の OAuth セッションを使う場合の自動更新コンテキスト。
+    /// credential store に OAuth セッションがあり、OAuth 設定も解決できるときのみ
+    /// `Some`。`credentials set token` で手動投入した Bearer token では `None`。
+    pub oauth: Option<OAuthAuto>,
+}
+
+/// Splunk token 失効時に Splunk token を再発行（Entra refresh + 再交換）する
+/// ために必要な情報一式。Authorizer が保持する。
+///
+/// `Debug` は派生しない（`session` 内の秘密値を展開させないため、手書き）。
+#[derive(Clone)]
+pub struct OAuthAuto {
+    pub session: crate::oauth::OAuthSession,
+    pub config: crate::oauth::OAuthConfig,
+    pub base_url: String,
+}
+
+impl std::fmt::Debug for OAuthAuto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthAuto")
+            .field("session", &self.session)
+            .field("config", &self.config)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 /// 認証方式。計画書の 3 系統に対応する。
@@ -76,6 +102,17 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
 
+    // --- Entra ID OAuth（`auth login` 用） ---
+    /// Entra ID テナント ID（GUID）。秘密値ではない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_tenant_id: Option<String>,
+    /// Entra ID Application (client) ID（GUID）。秘密値ではない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
+    /// 要求スコープ。未指定なら client_id から `api://<id>/user_impersonation` を導出。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_scope: Option<String>,
+
     // --- 挙動 ---
     /// servicesNS 用の既定 app。未指定時は "search"。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -98,6 +135,9 @@ impl std::fmt::Debug for Settings {
             .field("session_key", &mask(&self.session_key))
             .field("username", &self.username)
             .field("password", &mask(&self.password))
+            .field("oauth_tenant_id", &self.oauth_tenant_id)
+            .field("oauth_client_id", &self.oauth_client_id)
+            .field("oauth_scope", &self.oauth_scope)
             .field("default_app", &self.default_app)
             .field("default_user", &self.default_user)
             .field("format", &self.format)
@@ -289,23 +329,19 @@ pub fn resolve_credentials_with_store(
     settings: &Settings,
     store: Option<&dyn CredentialStore>,
 ) -> Result<Credentials> {
-    let base_url = std::env::var("SPLUNK_BASE_URL")
-        .ok()
-        .or_else(|| settings.base_url.clone())
-        .ok_or_else(|| {
-            SplunkError::Config(
-                "base_url not set. Set SPLUNK_BASE_URL or `base_url` in the config file. \
-Example: export SPLUNK_BASE_URL=https://<stack>.splunkcloud.com:8089"
-                    .to_string(),
-            )
-        })?;
+    let base_url = resolve_base_url(settings)?;
 
-    let token = resolve_secret(
-        std::env::var("SPLUNK_TOKEN").ok(),
-        store,
-        KEY_TOKEN,
-        settings.token.clone(),
-    );
+    let env_token = std::env::var("SPLUNK_TOKEN").ok().filter(|s| !s.is_empty());
+
+    // OAuth セッション（`auth login` 由来）を store から読む。env SPLUNK_TOKEN が
+    // 明示されている場合は、そのユーザー指定の固定値を優先し OAuth は使わない。
+    let oauth_auto = if env_token.is_none() {
+        resolve_oauth_auto(settings, store)
+    } else {
+        None
+    };
+
+    let token = resolve_secret(env_token, store, KEY_TOKEN, settings.token.clone());
     let session_key = resolve_secret(
         std::env::var("SPLUNK_SESSION_KEY").ok(),
         store,
@@ -322,8 +358,14 @@ Example: export SPLUNK_BASE_URL=https://<stack>.splunkcloud.com:8089"
         settings.password.clone(),
     );
 
+    // 認証方式の決定。優先度: env SPLUNK_TOKEN（= token, 上で解決）
+    //   → OAuth セッション（自動更新つき） → 手動 token → session_key → Basic。
+    // OAuth セッションは初期 Bearer に Splunk token を入れ、Authorizer が失効時に
+    // 自動更新する。
     let auth = if let Some(t) = token {
         AuthMethod::BearerToken(t)
+    } else if let Some(auto) = &oauth_auto {
+        AuthMethod::BearerToken(auto.session.splunk_token.clone())
     } else if let Some(sk) = session_key {
         AuthMethod::SessionKey(sk)
     } else if let (Some(u), Some(p)) = (username, password) {
@@ -333,9 +375,10 @@ Example: export SPLUNK_BASE_URL=https://<stack>.splunkcloud.com:8089"
         }
     } else {
         return Err(SplunkError::Config(
-            "no credential set. Set one of SPLUNK_TOKEN / SPLUNK_SESSION_KEY / \
-(SPLUNK_USERNAME + SPLUNK_PASSWORD), or `token` / `session_key` / (`username` + `password`) \
-in the config file, or store one via `splunk-cloud-cli credentials set`."
+            "no credential set. Run `splunk-cloud-cli auth login`, or set one of \
+SPLUNK_TOKEN / SPLUNK_SESSION_KEY / (SPLUNK_USERNAME + SPLUNK_PASSWORD), or \
+`token` / `session_key` / (`username` + `password`) in the config file, or store \
+one via `splunk-cloud-cli credentials set`."
                 .to_string(),
         ));
     };
@@ -353,11 +396,25 @@ in the config file, or store one via `splunk-cloud-cli credentials set`."
     ])
     .unwrap_or_else(|| "nobody".to_string());
 
+    // OAuth 自動更新は、auth が OAuth セッション由来の BearerToken のときだけ有効。
+    // env SPLUNK_TOKEN や手動 token / session_key / Basic のときは無効。
+    let oauth = match &auth {
+        AuthMethod::BearerToken(t)
+            if oauth_auto
+                .as_ref()
+                .is_some_and(|a| a.session.splunk_token == *t) =>
+        {
+            oauth_auto
+        }
+        _ => None,
+    };
+
     Ok(Credentials {
         base_url,
         auth,
         default_app,
         default_user,
+        oauth,
     })
 }
 
@@ -365,6 +422,93 @@ in the config file, or store one via `splunk-cloud-cli credentials set`."
 /// 設定ファイルに `default_user = ""` のような空値があっても既定値へフォールバックする。
 fn first_non_empty(candidates: &[Option<String>]) -> Option<String> {
     candidates.iter().flatten().find(|s| !s.is_empty()).cloned()
+}
+
+/// credential store に OAuth セッションがあり、OAuth 設定（tenant/client）と
+/// base_url が解決できる場合のみ `OAuthAuto` を返す。いずれか欠ければ `None`。
+///
+/// `None` を返しても致命的ではない（自動更新が効かないだけ）。OAuth 設定や
+/// セッションの欠落をエラーにしないのは、手動 token / session_key 等の
+/// ユーザーを巻き込まないため。
+fn resolve_oauth_auto(
+    settings: &Settings,
+    store: Option<&dyn CredentialStore>,
+) -> Option<OAuthAuto> {
+    let store = store?;
+    // store から OAuth セッション（JSON）を読む。バックエンド障害や未保存は None。
+    let raw = store.get(KEY_OAUTH_SESSION).ok().flatten()?;
+    if raw.is_empty() {
+        return None;
+    }
+    let session = crate::oauth::OAuthSession::from_json(&raw).ok()?;
+    let config = resolve_oauth_config(settings).ok()?;
+    let base_url = resolve_base_url(settings).ok()?;
+    Some(OAuthAuto {
+        session,
+        config,
+        base_url,
+    })
+}
+
+/// 接続先 base_url を「env → config.toml」の優先順で解決する。
+/// `auth login`（token 交換のため接続先が必要）と `resolve_credentials` が使う。
+pub fn resolve_base_url(settings: &Settings) -> Result<String> {
+    std::env::var("SPLUNK_BASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| settings.base_url.clone())
+        .ok_or_else(|| {
+            SplunkError::Config(
+                "base_url not set. Set SPLUNK_BASE_URL or `base_url` in the config file. \
+Example: export SPLUNK_BASE_URL=https://<stack>.splunkcloud.com:8089"
+                    .to_string(),
+            )
+        })
+}
+
+/// Entra ID OAuth 設定を「env → config.toml」の優先順で解決する。
+///
+/// `tenant_id` / `client_id` は秘密値ではないため、環境変数
+/// `SPLUNK_OAUTH_TENANT_ID` / `SPLUNK_OAUTH_CLIENT_ID` /
+/// `SPLUNK_OAUTH_SCOPE` でも上書きできる。`scope` 未指定時は
+/// client_id から `api://<id>/user_impersonation` を導出する。
+///
+/// `auth login` と、Authorizer による refresh の両方から使う。
+/// tenant_id / client_id のいずれかが欠けていれば設定不足としてエラーにする。
+pub fn resolve_oauth_config(settings: &Settings) -> Result<crate::oauth::OAuthConfig> {
+    let tenant_id = first_non_empty(&[
+        std::env::var("SPLUNK_OAUTH_TENANT_ID").ok(),
+        settings.oauth_tenant_id.clone(),
+    ])
+    .ok_or_else(|| {
+        SplunkError::Config(
+            "oauth_tenant_id not set. Add `oauth_tenant_id` to the config file \
+(or set SPLUNK_OAUTH_TENANT_ID) to use `auth login`."
+                .to_string(),
+        )
+    })?;
+    let client_id = first_non_empty(&[
+        std::env::var("SPLUNK_OAUTH_CLIENT_ID").ok(),
+        settings.oauth_client_id.clone(),
+    ])
+    .ok_or_else(|| {
+        SplunkError::Config(
+            "oauth_client_id not set. Add `oauth_client_id` to the config file \
+(or set SPLUNK_OAUTH_CLIENT_ID) to use `auth login`."
+                .to_string(),
+        )
+    })?;
+    let scope = first_non_empty(&[
+        std::env::var("SPLUNK_OAUTH_SCOPE").ok(),
+        settings.oauth_scope.clone(),
+    ])
+    .unwrap_or_else(|| crate::oauth::OAuthConfig::default_scope_for(&client_id));
+
+    Ok(crate::oauth::OAuthConfig {
+        tenant_id,
+        client_id,
+        scope,
+    })
 }
 
 #[cfg(test)]
