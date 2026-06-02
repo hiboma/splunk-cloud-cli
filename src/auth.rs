@@ -1,9 +1,7 @@
-use crate::config::credential_store::{
-    default_store, CredentialStore, KEY_REFRESH_TOKEN, KEY_TOKEN, KEY_TOKEN_EXPIRY,
-};
-use crate::config::{AuthMethod, Credentials, OAuthRefreshContext};
+use crate::config::credential_store::{default_store, CredentialStore, KEY_OAUTH_SESSION};
+use crate::config::{AuthMethod, Credentials, OAuthAuto};
 use crate::error::{Result, SplunkError};
-use crate::oauth;
+use crate::oauth::{self, OAuthSession};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -23,17 +21,16 @@ pub struct Authorizer {
     method: AuthMethod,
     cached_session: Arc<RwLock<Option<String>>>,
     http: reqwest::Client,
-    /// OAuth (Device Code) token の自動更新状態。`BearerToken` かつ
-    /// store に refresh token がある場合のみ `Some`。失効間近で refresh する。
+    /// OAuth (`auth login`) セッションの自動更新状態。OAuth セッション由来の
+    /// `BearerToken` のときだけ `Some`。Splunk token 失効時に再交換／refresh する。
     oauth: Option<Arc<RwLock<OAuthState>>>,
 }
 
-/// 自動更新が扱う可変状態。`access_token` は失効時に refresh で差し替わる。
+/// 自動更新が扱う可変状態。`session` は失効時に `ensure_fresh_session` で差し替わる。
 struct OAuthState {
     config: crate::oauth::OAuthConfig,
-    access_token: String,
-    refresh_token: String,
-    expires_at: u64,
+    base_url: String,
+    session: OAuthSession,
     /// 更新後の書き戻し先。テストではメモリストアを注入する。
     store: Arc<dyn CredentialStore>,
 }
@@ -101,38 +98,38 @@ impl Authorizer {
         Ok(headers)
     }
 
-    /// Bearer に載せる access token を返す。OAuth 自動更新が有効で失効間近なら
-    /// refresh して store に書き戻してから返す。それ以外は引数の固定値を返す。
+    /// Bearer に載せる Splunk token を返す。OAuth 自動更新が有効で Splunk token が
+    /// 失効間近なら、Entra access での再交換（必要なら Entra refresh）を行い、
+    /// store に書き戻してから返す。OAuth 無効（手動 Bearer）の場合は固定値を返す。
     async fn bearer_token(&self, fixed: &str) -> Result<String> {
         let Some(state_lock) = &self.oauth else {
             return Ok(fixed.to_string());
         };
 
-        // 失効していなければ現在の access token をそのまま返す（read ロックのみ）。
+        // Splunk token が失効していなければそのまま返す（read ロックのみ）。
         {
             let state = state_lock.read().await;
-            if !is_expired(state.expires_at) {
-                return Ok(state.access_token.clone());
+            if !state.session.splunk_expired(oauth::now_unix()) {
+                return Ok(state.session.splunk_token.clone());
             }
         }
 
-        // 失効間近。write ロックで二重チェックしてから refresh する。
+        // 失効間近。write ロックで二重チェックしてから更新する。
         let mut state = state_lock.write().await;
-        if !is_expired(state.expires_at) {
-            return Ok(state.access_token.clone());
+        if !state.session.splunk_expired(oauth::now_unix()) {
+            return Ok(state.session.splunk_token.clone());
         }
 
-        let new = oauth::refresh(&state.config, &self.http, &state.refresh_token).await?;
-        // 更新を store に書き戻す。書き戻し失敗は警告にとどめ、取得した
-        // token は今回のプロセスでは使えるようにする（次回起動で再 refresh）。
-        persist_refresh(state.store.as_ref(), &new);
-
-        state.access_token = new.access_token.clone();
-        state.expires_at = new.expires_at;
-        if let Some(rt) = new.refresh_token {
-            state.refresh_token = rt;
+        let (next, updated) =
+            oauth::ensure_fresh_session(&state.session, &state.config, &state.base_url, &self.http)
+                .await?;
+        if updated {
+            // 更新を store に 1 エントリ（JSON）で書き戻す。書き戻し失敗は警告に
+            // とどめ、取得した token は今回のプロセスで使えるようにする。
+            persist_session(state.store.as_ref(), &next);
+            state.session = next;
         }
-        Ok(state.access_token.clone())
+        Ok(state.session.splunk_token.clone())
     }
 
     /// キャッシュ済みの session key が無ければ `/services/auth/login` を叩く。
@@ -183,52 +180,43 @@ struct LoginResponse {
     session_key: String,
 }
 
-/// 安全マージン込みで失効しているか判定する。`oauth::EXPIRY_SKEW_SECS` を共有する。
-fn is_expired(expires_at: u64) -> bool {
-    oauth::now_unix().saturating_add(oauth::EXPIRY_SKEW_SECS) >= expires_at
-}
-
 /// `Credentials` から OAuth 自動更新の初期状態を組む。
 ///
 /// 次のすべてを満たすときのみ `Some`:
-///   - `auth` が `BearerToken`（現在の access token を初期値に使う）
-///   - `oauth_refresh` が `Some`（refresh token / expiry / OAuth 設定が揃う）
-///   - `store` が `Some`（refresh 結果の書き戻し先がある）
+///   - `auth` が `BearerToken`
+///   - `oauth` が `Some`（OAuth セッション / 設定 / base_url が揃う）
+///   - `store` が `Some`（更新結果の書き戻し先がある）
 fn build_oauth_state(
     creds: &Credentials,
     store: Option<Arc<dyn CredentialStore>>,
 ) -> Option<OAuthState> {
-    let AuthMethod::BearerToken(access_token) = &creds.auth else {
+    if !matches!(creds.auth, AuthMethod::BearerToken(_)) {
         return None;
-    };
-    let OAuthRefreshContext {
+    }
+    let OAuthAuto {
+        session,
         config,
-        refresh_token,
-        expires_at,
-    } = creds.oauth_refresh.clone()?;
+        base_url,
+    } = creds.oauth.clone()?;
     let store = store?;
     Some(OAuthState {
         config,
-        access_token: access_token.clone(),
-        refresh_token,
-        expires_at,
+        base_url,
+        session,
         store,
     })
 }
 
-/// refresh で得た新しい token / expiry / refresh token を store に書き戻す。
+/// 更新後の OAuth セッションを store に 1 エントリ（JSON）で書き戻す。
 /// 失敗は標準エラーへの警告にとどめる（今回取得した token は使えるため）。
-fn persist_refresh(store: &dyn CredentialStore, new: &oauth::TokenSet) {
-    if let Err(e) = store.set(KEY_TOKEN, &new.access_token) {
-        eprintln!("warning: failed to persist refreshed access token: {}", e);
-    }
-    if let Err(e) = store.set(KEY_TOKEN_EXPIRY, &new.expires_at.to_string()) {
-        eprintln!("warning: failed to persist refreshed token expiry: {}", e);
-    }
-    if let Some(rt) = &new.refresh_token {
-        if let Err(e) = store.set(KEY_REFRESH_TOKEN, rt) {
-            eprintln!("warning: failed to persist rotated refresh token: {}", e);
+fn persist_session(store: &dyn CredentialStore, session: &OAuthSession) {
+    match session.to_json() {
+        Ok(json) => {
+            if let Err(e) = store.set(KEY_OAUTH_SESSION, &json) {
+                eprintln!("warning: failed to persist refreshed oauth session: {}", e);
+            }
         }
+        Err(e) => eprintln!("warning: failed to serialize oauth session: {}", e),
     }
 }
 
@@ -236,8 +224,8 @@ fn persist_refresh(store: &dyn CredentialStore, new: &oauth::TokenSet) {
 mod tests {
     use super::*;
     use crate::config::credential_store::test_support::MemoryStore;
-    use crate::config::Credentials;
-    use crate::oauth::{OAuthConfig, TokenSet};
+    use crate::config::{Credentials, OAuthAuto};
+    use crate::oauth::{OAuthConfig, OAuthSession};
 
     fn oauth_config() -> OAuthConfig {
         OAuthConfig {
@@ -247,44 +235,43 @@ mod tests {
         }
     }
 
-    fn bearer_creds(expires_at: u64, with_refresh: bool) -> Credentials {
+    fn make_session(splunk_exp: u64) -> OAuthSession {
+        OAuthSession {
+            splunk_token: "SPLUNK".into(),
+            splunk_expires_at: splunk_exp,
+            entra_access_token: "ENTRA".into(),
+            entra_expires_at: splunk_exp,
+            refresh_token: Some("RT".into()),
+        }
+    }
+
+    fn oauth_creds(splunk_exp: u64, with_oauth: bool) -> Credentials {
+        let session = make_session(splunk_exp);
         Credentials {
             base_url: "https://example.splunkcloud.com:8089".into(),
-            auth: AuthMethod::BearerToken("AT".into()),
+            auth: AuthMethod::BearerToken(session.splunk_token.clone()),
             default_app: "search".into(),
             default_user: "nobody".into(),
-            oauth_refresh: with_refresh.then(|| OAuthRefreshContext {
+            oauth: with_oauth.then(|| OAuthAuto {
+                session,
                 config: oauth_config(),
-                refresh_token: "RT".into(),
-                expires_at,
+                base_url: "https://example.splunkcloud.com:8089".into(),
             }),
         }
     }
 
     #[test]
-    fn is_expired_respects_skew() {
-        let now = oauth::now_unix();
-        // 余裕たっぷり先 → not expired
-        assert!(!is_expired(now + 3600));
-        // マージン（60 秒）内 → expired 扱い
-        assert!(is_expired(now + 30));
-        // 過去 → expired
-        assert!(is_expired(now.saturating_sub(10)));
-    }
-
-    #[test]
-    fn build_oauth_state_requires_refresh_context() {
+    fn build_oauth_state_requires_oauth_context() {
         let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
-        // oauth_refresh なし → None
-        assert!(build_oauth_state(&bearer_creds(0, false), Some(store.clone())).is_none());
-        // oauth_refresh あり → Some
-        assert!(build_oauth_state(&bearer_creds(123, true), Some(store)).is_some());
+        // oauth なし → None
+        assert!(build_oauth_state(&oauth_creds(0, false), Some(store.clone())).is_none());
+        // oauth あり → Some
+        assert!(build_oauth_state(&oauth_creds(123, true), Some(store)).is_some());
     }
 
     #[test]
     fn build_oauth_state_none_without_store() {
-        // store が無ければ書き戻せないので無効化
-        assert!(build_oauth_state(&bearer_creds(123, true), None).is_none());
+        assert!(build_oauth_state(&oauth_creds(123, true), None).is_none());
     }
 
     #[test]
@@ -294,7 +281,7 @@ mod tests {
             auth: AuthMethod::SessionKey("SK".into()),
             default_app: "search".into(),
             default_user: "nobody".into(),
-            oauth_refresh: None,
+            oauth: None,
         };
         let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
         assert!(build_oauth_state(&creds, Some(store)).is_none());
@@ -303,17 +290,17 @@ mod tests {
     #[tokio::test]
     async fn bearer_token_returns_current_when_valid() {
         let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
-        let creds = bearer_creds(oauth::now_unix() + 3600, true);
+        let creds = oauth_creds(oauth::now_unix() + 3600, true);
         let auth = Authorizer::new_with_store(&creds, reqwest::Client::new(), Some(store));
-        // 失効していないので refresh せず現在の AT を返す
-        let tok = auth.bearer_token("AT").await.unwrap();
-        assert_eq!(tok, "AT");
+        // Splunk token が失効していないので更新せず現在値を返す
+        let tok = auth.bearer_token("SPLUNK").await.unwrap();
+        assert_eq!(tok, "SPLUNK");
     }
 
     #[tokio::test]
     async fn bearer_token_fixed_when_no_oauth() {
         // OAuth 無効（手動 Bearer）の場合は固定値をそのまま使う
-        let creds = bearer_creds(0, false);
+        let creds = oauth_creds(0, false);
         let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
         let auth = Authorizer::new_with_store(&creds, reqwest::Client::new(), Some(store));
         let tok = auth.bearer_token("FIXED").await.unwrap();
@@ -321,39 +308,13 @@ mod tests {
     }
 
     #[test]
-    fn persist_refresh_writes_store() {
+    fn persist_session_writes_json_entry() {
         let store = MemoryStore::new();
-        let new = TokenSet {
-            access_token: "NEW".into(),
-            refresh_token: Some("NEWR".into()),
-            expires_at: 9999,
-        };
-        persist_refresh(&store, &new);
-        assert_eq!(store.get(KEY_TOKEN).unwrap().as_deref(), Some("NEW"));
-        assert_eq!(
-            store.get(KEY_TOKEN_EXPIRY).unwrap().as_deref(),
-            Some("9999")
-        );
-        assert_eq!(
-            store.get(KEY_REFRESH_TOKEN).unwrap().as_deref(),
-            Some("NEWR")
-        );
-    }
-
-    #[test]
-    fn persist_refresh_keeps_old_refresh_when_not_rotated() {
-        let store = MemoryStore::new();
-        store.set(KEY_REFRESH_TOKEN, "OLD").unwrap();
-        let new = TokenSet {
-            access_token: "NEW".into(),
-            refresh_token: None,
-            expires_at: 1,
-        };
-        persist_refresh(&store, &new);
-        // ローテーションが無ければ既存の refresh token を維持する
-        assert_eq!(
-            store.get(KEY_REFRESH_TOKEN).unwrap().as_deref(),
-            Some("OLD")
-        );
+        persist_session(&store, &make_session(9999));
+        let raw = store.get(KEY_OAUTH_SESSION).unwrap().unwrap();
+        let back = OAuthSession::from_json(&raw).unwrap();
+        assert_eq!(back.splunk_token, "SPLUNK");
+        assert_eq!(back.splunk_expires_at, 9999);
+        assert_eq!(back.refresh_token.as_deref(), Some("RT"));
     }
 }

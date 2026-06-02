@@ -1,11 +1,9 @@
 use crate::cli::{AuthCmd, OutputFormat};
 use crate::client::SplunkClient;
-use crate::config::credential_store::{
-    default_store, CredentialStore, KEY_REFRESH_TOKEN, KEY_TOKEN, KEY_TOKEN_EXPIRY,
-};
-use crate::config::{resolve_oauth_config, Settings};
+use crate::config::credential_store::{default_store, CredentialStore, KEY_OAUTH_SESSION};
+use crate::config::{resolve_base_url, resolve_oauth_config, Settings};
 use crate::error::{Result, SplunkError};
-use crate::oauth::{self, TokenSet, TokioSleeper, UserPrompt};
+use crate::oauth::{self, OAuthSession, TokioSleeper, UserPrompt};
 use crate::output::print_value;
 
 /// Splunk への接続を必要とする `auth` サブコマンド（`whoami`）。
@@ -94,10 +92,21 @@ async fn login(settings: &Settings, store: &dyn CredentialStore, copy: bool) -> 
         eprintln!("Waiting for you to complete sign-in in the browser...");
     };
 
-    let token = oauth::device_code_login(&cfg, &http, &TokioSleeper, &on_prompt).await?;
-    save_token(store, &token)?;
+    let entra = oauth::device_code_login(&cfg, &http, &TokioSleeper, &on_prompt).await?;
 
-    eprintln!("Signed in. Access token stored in the OS credential store.");
+    // Splunk Cloud は Entra JWT を REST API で直接受理しない。`oauth2/v1/token` で
+    // Splunk 発行トークンへ交換する。
+    let base_url = resolve_base_url(settings)?;
+    let splunk =
+        oauth::exchange_for_splunk_token(&base_url, &cfg.client_id, &http, &entra.access_token)
+            .await?;
+
+    // セッション一式（Splunk token / Entra access / refresh / 各 expiry）を
+    // 1 つの JSON エントリにまとめて保存する。Keychain アクセスは 1 回。
+    let session = OAuthSession::from_login(&entra, &splunk);
+    save_session(store, &session)?;
+
+    eprintln!("Signed in. Splunk access token stored in the OS credential store.");
     Ok(())
 }
 
@@ -202,96 +211,70 @@ fn open_in_browser(url: &str) -> bool {
 }
 
 fn logout(store: &dyn CredentialStore) -> Result<()> {
-    // delete は存在しないエントリでも Ok を返す実装なので、3 つとも無条件に消す。
-    for key in [KEY_TOKEN, KEY_REFRESH_TOKEN, KEY_TOKEN_EXPIRY] {
-        store
-            .delete(key)
-            .map_err(|e| SplunkError::Config(format!("failed to delete {}: {}", key, e)))?;
-    }
-    eprintln!("Signed out. Stored OAuth token, refresh token, and expiry removed.");
+    // OAuth セッションは 1 エントリ（JSON）に集約済み。それを消す。
+    store
+        .delete(KEY_OAUTH_SESSION)
+        .map_err(|e| SplunkError::Config(format!("failed to delete oauth session: {}", e)))?;
+    eprintln!("Signed out. Stored OAuth session removed.");
     Ok(())
 }
 
 fn status(store: &dyn CredentialStore) -> Result<()> {
-    let has_token = read_opt(store, KEY_TOKEN)?.is_some();
-    let has_refresh = read_opt(store, KEY_REFRESH_TOKEN)?.is_some();
-    let expiry = read_opt(store, KEY_TOKEN_EXPIRY)?.and_then(|s| s.parse::<u64>().ok());
-
-    if !has_token {
-        println!("No OAuth access token stored. Run `auth login` to sign in.");
+    let Some(session) = load_session(store)? else {
+        println!("No OAuth session stored. Run `auth login` to sign in.");
         return Ok(());
-    }
+    };
 
-    println!("Access token: stored");
+    println!("Splunk access token: stored");
     println!(
-        "Refresh token: {}",
-        if has_refresh { "stored" } else { "absent" }
+        "Entra refresh token: {}",
+        if session.refresh_token.is_some() {
+            "stored"
+        } else {
+            "absent"
+        }
     );
-    match expiry {
-        Some(exp) => {
-            let now = oauth::now_unix();
-            // 自動更新は `oauth::EXPIRY_SKEW_SECS` のマージン込みで失効判定する。
-            // status の表示もこのマージンに合わせ、「valid 表示なのに次の
-            // リクエストで refresh が走る」境界のずれをなくす。
-            let refresh_threshold = exp.saturating_sub(oauth::EXPIRY_SKEW_SECS);
-            if now >= exp {
-                println!("Status: expired ({} seconds ago)", now - exp);
-                if has_refresh {
-                    println!("It will be refreshed automatically on the next request.");
-                } else {
-                    println!("No refresh token; run `auth login` again.");
-                }
-            } else if now >= refresh_threshold {
-                // 失効はしていないがマージン内。次のリクエストで refresh される。
-                println!("Status: expiring within {}s", exp - now);
-                if has_refresh {
-                    println!("It will be refreshed automatically on the next request.");
-                } else {
-                    println!("No refresh token; run `auth login` again soon.");
-                }
-            } else {
-                let remaining = exp - now;
-                println!(
-                    "Status: valid for {} more seconds (~{} min)",
-                    remaining,
-                    remaining / 60
-                );
-            }
-        }
-        None => println!("Expiry: unknown (no expiry recorded)"),
+
+    let now = oauth::now_unix();
+    let exp = session.splunk_expires_at;
+    // 自動更新は `oauth::EXPIRY_SKEW_SECS` のマージン込みで失効判定する。
+    // status の表示もこのマージンに合わせ、「valid 表示なのに次の
+    // リクエストで refresh が走る」境界のずれをなくす。
+    let refresh_threshold = exp.saturating_sub(oauth::EXPIRY_SKEW_SECS);
+    if now >= exp {
+        println!("Status: Splunk token expired ({} seconds ago)", now - exp);
+        println!("It will be refreshed automatically on the next request.");
+    } else if now >= refresh_threshold {
+        println!("Status: Splunk token expiring within {}s", exp - now);
+        println!("It will be refreshed automatically on the next request.");
+    } else {
+        let remaining = exp - now;
+        println!(
+            "Status: Splunk token valid for {} more seconds (~{} min)",
+            remaining,
+            remaining / 60
+        );
     }
     Ok(())
 }
 
-/// 取得した `TokenSet` を credential store へ保存する。
-///
-/// access token は既存の `token` キーに保存することで、以後の REST 呼び出しが
-/// 追加実装なしに Bearer 認証で動く。refresh token と失効時刻も併せて保存する。
-fn save_token(store: &dyn CredentialStore, token: &TokenSet) -> Result<()> {
+/// OAuth セッションを credential store の単一 JSON エントリへ保存する。
+fn save_session(store: &dyn CredentialStore, session: &OAuthSession) -> Result<()> {
+    let json = session.to_json()?;
     store
-        .set(KEY_TOKEN, &token.access_token)
-        .map_err(|e| SplunkError::Config(format!("failed to store access token: {}", e)))?;
-    store
-        .set(KEY_TOKEN_EXPIRY, &token.expires_at.to_string())
-        .map_err(|e| SplunkError::Config(format!("failed to store token expiry: {}", e)))?;
-    match &token.refresh_token {
-        Some(rt) => store
-            .set(KEY_REFRESH_TOKEN, rt)
-            .map_err(|e| SplunkError::Config(format!("failed to store refresh token: {}", e)))?,
-        None => {
-            // refresh token が返らなかった場合、古いものを残すと混乱するので消す。
-            store.delete(KEY_REFRESH_TOKEN).map_err(|e| {
-                SplunkError::Config(format!("failed to clear stale refresh token: {}", e))
-            })?;
-        }
-    }
-    Ok(())
+        .set(KEY_OAUTH_SESSION, &json)
+        .map_err(|e| SplunkError::Config(format!("failed to store oauth session: {}", e)))
 }
 
-fn read_opt(store: &dyn CredentialStore, key: &str) -> Result<Option<String>> {
-    store
-        .get(key)
-        .map_err(|e| SplunkError::Config(format!("failed to read {}: {}", key, e)))
+/// credential store から OAuth セッションを読み出す。未保存なら None。
+pub fn load_session(store: &dyn CredentialStore) -> Result<Option<OAuthSession>> {
+    let raw = store
+        .get(KEY_OAUTH_SESSION)
+        .map_err(|e| SplunkError::Config(format!("failed to read oauth session: {}", e)))?;
+    match raw {
+        Some(s) if !s.is_empty() => Ok(Some(OAuthSession::from_json(&s)?)),
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -299,61 +282,62 @@ mod tests {
     use super::*;
     use crate::config::credential_store::test_support::MemoryStore;
 
-    fn token(expires_at: u64, refresh: Option<&str>) -> TokenSet {
-        TokenSet {
-            access_token: "AT".into(),
+    fn session(refresh: Option<&str>, splunk_exp: u64) -> OAuthSession {
+        OAuthSession {
+            splunk_token: "SPLUNK".into(),
+            splunk_expires_at: splunk_exp,
+            entra_access_token: "ENTRA".into(),
+            entra_expires_at: 11111,
             refresh_token: refresh.map(String::from),
-            expires_at,
         }
     }
 
     #[test]
-    fn save_token_writes_all_three_keys() {
+    fn save_and_load_session_roundtrip() {
         let store = MemoryStore::new();
-        save_token(&store, &token(12345, Some("RT"))).unwrap();
-        assert_eq!(store.get(KEY_TOKEN).unwrap().as_deref(), Some("AT"));
-        assert_eq!(store.get(KEY_REFRESH_TOKEN).unwrap().as_deref(), Some("RT"));
-        assert_eq!(
-            store.get(KEY_TOKEN_EXPIRY).unwrap().as_deref(),
-            Some("12345")
-        );
+        save_session(&store, &session(Some("RT"), 22222)).unwrap();
+        // 1 エントリ（JSON）にまとまっている。
+        assert!(store.get(KEY_OAUTH_SESSION).unwrap().is_some());
+        let loaded = load_session(&store).unwrap().unwrap();
+        assert_eq!(loaded.splunk_token, "SPLUNK");
+        assert_eq!(loaded.splunk_expires_at, 22222);
+        assert_eq!(loaded.entra_access_token, "ENTRA");
+        assert_eq!(loaded.refresh_token.as_deref(), Some("RT"));
     }
 
     #[test]
-    fn save_token_clears_stale_refresh_when_absent() {
+    fn load_session_none_when_empty() {
         let store = MemoryStore::new();
-        store.set(KEY_REFRESH_TOKEN, "OLD").unwrap();
-        save_token(&store, &token(1, None)).unwrap();
-        assert!(store.get(KEY_REFRESH_TOKEN).unwrap().is_none());
+        assert!(load_session(&store).unwrap().is_none());
     }
 
     #[test]
-    fn logout_removes_all_keys() {
+    fn session_debug_redacts_secrets() {
+        let dbg = format!("{:?}", session(Some("super-refresh"), 1));
+        assert!(!dbg.contains("SPLUNK"));
+        assert!(!dbg.contains("ENTRA"));
+        assert!(!dbg.contains("super-refresh"));
+        assert!(dbg.contains("***"));
+    }
+
+    #[test]
+    fn logout_removes_session() {
         let store = MemoryStore::new();
-        store.set(KEY_TOKEN, "AT").unwrap();
-        store.set(KEY_REFRESH_TOKEN, "RT").unwrap();
-        store.set(KEY_TOKEN_EXPIRY, "99").unwrap();
+        save_session(&store, &session(Some("RT"), 1)).unwrap();
         logout(&store).unwrap();
-        assert!(store.get(KEY_TOKEN).unwrap().is_none());
-        assert!(store.get(KEY_REFRESH_TOKEN).unwrap().is_none());
-        assert!(store.get(KEY_TOKEN_EXPIRY).unwrap().is_none());
+        assert!(store.get(KEY_OAUTH_SESSION).unwrap().is_none());
     }
 
     #[test]
-    fn status_runs_without_token() {
+    fn status_runs_without_session() {
         let store = MemoryStore::new();
-        // 標準出力に出すだけなので、エラーなく終わることを確認する。
         status(&store).unwrap();
     }
 
     #[test]
-    fn status_runs_with_token() {
+    fn status_runs_with_session() {
         let store = MemoryStore::new();
-        store.set(KEY_TOKEN, "AT").unwrap();
-        store.set(KEY_REFRESH_TOKEN, "RT").unwrap();
-        store
-            .set(KEY_TOKEN_EXPIRY, &(oauth::now_unix() + 3600).to_string())
-            .unwrap();
+        save_session(&store, &session(Some("RT"), oauth::now_unix() + 3600)).unwrap();
         status(&store).unwrap();
     }
 }
