@@ -1,5 +1,5 @@
 use clap::{CommandFactory, Parser};
-use splunk_cloud_cli::cli::{Cli, Command, OutputFormat};
+use splunk_cloud_cli::cli::{AuthCmd, Cli, Command, OutputFormat};
 use splunk_cloud_cli::client::SplunkClient;
 use splunk_cloud_cli::commands;
 use splunk_cloud_cli::config::{load_settings, resolve_credentials};
@@ -57,6 +57,14 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     let settings = load_settings()?;
+
+    // `auth login` / `logout` / `status` は Splunk への接続を必要としない
+    // （認証情報の取得・破棄・確認そのものが目的）。client を組む前に処理する。
+    // `auth whoami` は接続が必要なので下のディスパッチに任せる。
+    if let Command::Auth(c @ (AuthCmd::Login | AuthCmd::Logout | AuthCmd::Status)) = &cli.command {
+        return commands::auth::run_oauth(c, &settings).await;
+    }
+
     let format = cli
         .format
         .or(settings.format)

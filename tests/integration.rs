@@ -9,6 +9,7 @@ fn creds(server_url: &str) -> Credentials {
         auth: AuthMethod::BearerToken("test-token".to_string()),
         default_app: "search".to_string(),
         default_user: "nobody".to_string(),
+        oauth_refresh: None,
     }
 }
 
@@ -364,6 +365,7 @@ async fn http_on_non_loopback_is_rejected() {
         auth: AuthMethod::BearerToken("t".into()),
         default_app: "search".into(),
         default_user: "nobody".into(),
+        oauth_refresh: None,
     };
     // `SplunkClient` は Debug を派生しないため `expect_err` は使えない。
     // `auth` に session key が載るので派生 Debug 経由の漏洩を防ぐための設計。

@@ -426,6 +426,7 @@ mod tests {
             auth: AuthMethod::BearerToken("dummy".to_string()),
             default_app: default_app.to_string(),
             default_user: default_user.to_string(),
+            oauth_refresh: None,
         };
         SplunkClient::new(creds).unwrap()
     }

@@ -70,7 +70,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Authentication (whoami).
+    /// Authentication: OAuth device-code login/logout/status and whoami.
     #[command(subcommand)]
     Auth(AuthCmd),
 
@@ -182,6 +182,17 @@ impl CredentialField {
 pub enum AuthCmd {
     /// Show current authentication context via `/services/authentication/current-context`.
     Whoami,
+    /// Sign in to Entra ID via the OAuth 2.0 device code flow and store the
+    /// resulting access/refresh token in the OS credential store.
+    ///
+    /// Requires `oauth_tenant_id` / `oauth_client_id` in the config file
+    /// (or `SPLUNK_OAUTH_TENANT_ID` / `SPLUNK_OAUTH_CLIENT_ID`).
+    Login,
+    /// Remove the stored OAuth access token, refresh token, and expiry.
+    Logout,
+    /// Show whether an OAuth token is stored and how long it remains valid.
+    /// Never prints the token value itself.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
