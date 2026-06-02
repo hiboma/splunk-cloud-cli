@@ -104,12 +104,24 @@ fn status(store: &dyn CredentialStore) -> Result<()> {
     match expiry {
         Some(exp) => {
             let now = oauth::now_unix();
+            // 自動更新は `oauth::EXPIRY_SKEW_SECS` のマージン込みで失効判定する。
+            // status の表示もこのマージンに合わせ、「valid 表示なのに次の
+            // リクエストで refresh が走る」境界のずれをなくす。
+            let refresh_threshold = exp.saturating_sub(oauth::EXPIRY_SKEW_SECS);
             if now >= exp {
                 println!("Status: expired ({} seconds ago)", now - exp);
                 if has_refresh {
                     println!("It will be refreshed automatically on the next request.");
                 } else {
                     println!("No refresh token; run `auth login` again.");
+                }
+            } else if now >= refresh_threshold {
+                // 失効はしていないがマージン内。次のリクエストで refresh される。
+                println!("Status: expiring within {}s", exp - now);
+                if has_refresh {
+                    println!("It will be refreshed automatically on the next request.");
+                } else {
+                    println!("No refresh token; run `auth login` again soon.");
                 }
             } else {
                 let remaining = exp - now;

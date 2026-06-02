@@ -232,11 +232,21 @@ pub async fn device_code_login(
     let deadline = now_unix().saturating_add(dc.expires_in.min(MAX_POLL_SECS));
 
     loop {
+        // デッドライン超過なら待たずに即座に打ち切る。チェックを sleep の前に
+        // 置くことで、期限切れ後に無駄な待機やポーリングを行わない。
+        if now_unix() >= deadline {
+            return Err(SplunkError::Auth(
+                "device code flow timed out before authorization completed".to_string(),
+            ));
+        }
+
         sleeper.sleep(interval).await;
 
         match poll_token(cfg, http, &dc.device_code).await? {
             PollOutcome::Success(tok) => return Ok(tok),
             PollOutcome::Pending => {}
+            // RFC 8628: `slow_down` を受けたら次回以降のポーリング間隔を広げる。
+            // 広げた `interval` は次周回の `sleep` で効く。
             PollOutcome::SlowDown => interval = interval.saturating_add(5),
             PollOutcome::Failed { error, description } => {
                 return Err(SplunkError::Auth(format!(
@@ -245,12 +255,6 @@ pub async fn device_code_login(
                     description.unwrap_or_else(|| "no description".to_string())
                 )));
             }
-        }
-
-        if now_unix() >= deadline {
-            return Err(SplunkError::Auth(
-                "device code flow timed out before authorization completed".to_string(),
-            ));
         }
     }
 }
@@ -612,6 +616,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn device_login_times_out_when_deadline_passed() {
+        let mut server = mockito::Server::new_async().await;
+        // `expires_in: 0` なのでデッドラインは即座に過ぎる。ループ先頭の
+        // 判定で、ポーリングに入る前にタイムアウトする。
+        server
+            .mock("POST", "/devicecode")
+            .with_status(200)
+            .with_body(
+                r#"{"device_code":"DC","user_code":"UC","verification_uri":"https://e/d","expires_in":0,"interval":1}"#,
+            )
+            .create_async()
+            .await;
+        // pending を返し続けるモック。デッドライン判定が無ければ無限ループになる。
+        server
+            .mock("POST", "/token")
+            .with_status(400)
+            .with_body(r#"{"error":"authorization_pending"}"#)
+            .create_async()
+            .await;
+
+        let http = reqwest::Client::new();
+        let prompt = noop_prompt();
+        let err = device_code_login_against(&server.url(), "c", "s", &http, &NoSleep, &*prompt)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "got: {}", err);
+    }
+
+    #[tokio::test]
     async fn refresh_succeeds() {
         let mut server = mockito::Server::new_async().await;
         let m = server
@@ -678,7 +711,14 @@ mod tests {
         });
 
         let mut interval = dc.interval.max(1);
+        // 本番 `device_code_login` と同じデッドライン経路を再現する。
+        let deadline = now_unix().saturating_add(dc.expires_in.min(MAX_POLL_SECS));
         loop {
+            if now_unix() >= deadline {
+                return Err(SplunkError::Auth(
+                    "device code flow timed out before authorization completed".to_string(),
+                ));
+            }
             sleeper.sleep(interval).await;
             let resp = http
                 .post(&token_url)
