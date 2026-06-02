@@ -15,13 +15,21 @@ use std::fmt;
 pub const SERVICE: &str = "dev.splunk-cloud-cli";
 
 /// Bearer token を格納するエントリのキー。
+/// OAuth (Device Code) フローで得た access token もここに保存する。
 pub const KEY_TOKEN: &str = "token";
 /// Splunk session key を格納するエントリのキー。
 pub const KEY_SESSION_KEY: &str = "session_key";
 /// Basic 認証用パスワードを格納するエントリのキー。
 pub const KEY_PASSWORD: &str = "password";
+/// OAuth refresh token を格納するエントリのキー（長期有効な秘密値）。
+pub const KEY_REFRESH_TOKEN: &str = "refresh_token";
+/// access token の失効 UNIX 時刻（秒）を格納するエントリのキー。
+/// 値そのものは秘密ではないが、token と寿命を同じストアで管理するためここに置く。
+pub const KEY_TOKEN_EXPIRY: &str = "token_expiry";
 
-/// 既知のキー一覧。`status` / テスト / 逐次走査で使う。
+/// `credentials` サブコマンドが set/delete/status で扱う 3 フィールド。
+/// OAuth 由来の refresh_token / token_expiry は `auth login` / `auth logout` が
+/// 管理するため、ここには含めない。
 pub const KNOWN_KEYS: &[&str] = &[KEY_TOKEN, KEY_SESSION_KEY, KEY_PASSWORD];
 
 #[derive(Debug)]
@@ -49,7 +57,7 @@ impl std::error::Error for StoreError {}
 /// `get` はエントリが存在しない通常状態を `Ok(None)` で返す。
 /// バックエンド起因の失敗は `Err` として伝播させ、
 /// 呼び出し側が「未保存」と「到達不能」を区別できるようにする。
-pub trait CredentialStore {
+pub trait CredentialStore: Send + Sync {
     fn get(&self, key: &str) -> Result<Option<String>, StoreError>;
     fn set(&self, key: &str, value: &str) -> Result<(), StoreError>;
     fn delete(&self, key: &str) -> Result<(), StoreError>;
