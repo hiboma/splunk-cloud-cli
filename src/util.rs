@@ -41,6 +41,15 @@ fn read_data_arg_with_limit(value: &str, limit: u64) -> Result<String> {
     Ok(value.to_string())
 }
 
+/// 先頭から最大 `max` 文字を返す（char 境界で安全に切る）。
+///
+/// `String::truncate` / `str::truncate` はバイト位置が char 境界でないと
+/// panic する。HTTP エラー本文を短く出すような用途で、マルチバイト文字や
+/// `String::from_utf8_lossy` 由来の U+FFFD を含む文字列を安全に切り詰める。
+pub fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
 /// `key=value` 形式の文字列を `(key, value)` に分解する。
 pub fn parse_kv(s: &str) -> Result<(String, String)> {
     let (k, v) = s
@@ -70,6 +79,36 @@ mod tests {
     #[test]
     fn parse_kv_err() {
         assert!(parse_kv("novalue").is_err());
+    }
+
+    #[test]
+    fn truncate_chars_keeps_short_strings() {
+        assert_eq!(truncate_chars("hello", 200), "hello");
+    }
+
+    #[test]
+    fn truncate_chars_limits_by_chars() {
+        let s: String = "a".repeat(300);
+        assert_eq!(truncate_chars(&s, 200).chars().count(), 200);
+    }
+
+    #[test]
+    fn truncate_chars_does_not_panic_on_multibyte_boundary() {
+        // マルチバイト文字（各 3 バイト）。バイト truncate なら境界で panic するが、
+        // char 単位なら安全。100 文字に収め、panic しないことを確認する。
+        let s: String = "あ".repeat(300);
+        let out = truncate_chars(&s, 100);
+        assert_eq!(out.chars().count(), 100);
+        assert!(out.chars().all(|c| c == 'あ'));
+    }
+
+    #[test]
+    fn truncate_chars_handles_replacement_char() {
+        // from_utf8_lossy が生む U+FFFD（3 バイト）混じりでも安全に切る。
+        let raw = b"ok\xff\xfe more text that is long enough to exceed".to_vec();
+        let lossy = String::from_utf8_lossy(&raw);
+        let out = truncate_chars(&lossy, 5);
+        assert_eq!(out.chars().count(), 5);
     }
 
     #[test]

@@ -120,16 +120,34 @@ impl Authorizer {
             return Ok(state.session.splunk_token.clone());
         }
 
-        let (next, updated) =
-            oauth::ensure_fresh_session(&state.session, &state.config, &state.base_url, &self.http)
-                .await?;
-        if updated {
-            // 更新を store に 1 エントリ（JSON）で書き戻す。書き戻し失敗は警告に
-            // とどめ、取得した token は今回のプロセスで使えるようにする。
-            persist_session(state.store.as_ref(), &next);
-            state.session = next;
+        match oauth::ensure_fresh_session(
+            &state.session,
+            &state.config,
+            &state.base_url,
+            &self.http,
+        )
+        .await
+        {
+            Ok(refreshed) => {
+                if refreshed.changed {
+                    // 更新を store に 1 エントリ（JSON）で書き戻す。書き戻し失敗は
+                    // 警告にとどめ、取得した token は今回のプロセスで使えるようにする。
+                    persist_session(state.store.as_ref(), &refreshed.session);
+                    state.session = refreshed.session;
+                }
+                Ok(state.session.splunk_token.clone())
+            }
+            Err(e) => {
+                // Entra refresh までは成功して Splunk 交換で失敗した場合、前進した
+                // 中間セッションを保存しておく（次回の再 refresh の無駄と、
+                // refresh token ローテーション時の喪失を防ぐ）。
+                if let Some(partial) = e.partial {
+                    persist_session(state.store.as_ref(), &partial);
+                    state.session = partial;
+                }
+                Err(e.error)
+            }
         }
-        Ok(state.session.splunk_token.clone())
     }
 
     /// キャッシュ済みの session key が無ければ `/services/auth/login` を叩く。
@@ -154,8 +172,8 @@ impl Authorizer {
             .await?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let mut body = resp.text().await.unwrap_or_default();
-            body.truncate(200);
+            let body = resp.text().await.unwrap_or_default();
+            let body = crate::util::truncate_chars(&body, 200);
             return Err(SplunkError::Auth(format!("{}: {}", status, body)));
         }
         let parsed: LoginResponse = resp.json().await?;
@@ -163,10 +181,24 @@ impl Authorizer {
         Ok(parsed.session_key)
     }
 
-    /// キャッシュされた session を破棄する。401 応答時などに使用する。
+    /// キャッシュされた認証状態を失効扱いにする。401 応答時などに使用する。
+    ///
+    /// - Basic 認証: キャッシュ済み session key を破棄し、次回 `/services/auth/login`
+    ///   を再実行させる。
+    /// - OAuth: Splunk token の expiry を「過去」に倒し、次回 `bearer_token` で
+    ///   必ず再交換させる。Splunk がクロックずれ等で期限前に token を失効させた
+    ///   （サーバ側失効）場合に、`splunk_expired` が false のまま再交換されず
+    ///   401 を繰り返す事態を防ぐ。
     pub async fn invalidate(&self) {
-        let mut guard = self.cached_session.write().await;
-        *guard = None;
+        {
+            let mut guard = self.cached_session.write().await;
+            *guard = None;
+        }
+        if let Some(state_lock) = &self.oauth {
+            let mut state = state_lock.write().await;
+            // 過去（0）に倒す。次の bearer_token が必ず失効と判定する。
+            state.session.splunk_expires_at = 0;
+        }
     }
 }
 

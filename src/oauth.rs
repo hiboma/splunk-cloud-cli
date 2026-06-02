@@ -406,51 +406,104 @@ impl OAuthSession {
     }
 }
 
+/// `ensure_fresh_session` の結果。
+pub struct Refreshed {
+    /// 更新後（または未更新ならそのまま）のセッション。
+    pub session: OAuthSession,
+    /// 入力から `session` が変化したか（変化したら store へ書き戻すべき）。
+    pub changed: bool,
+}
+
 /// Splunk token を有効な状態にして返す。必要なら 3 段階で更新する。
 ///
-/// 1. Splunk token が有効 → そのまま返す（更新なし、`updated=false`）
+/// 1. Splunk token が有効 → そのまま返す（`changed=false`）
 /// 2. Splunk token 失効 & Entra access 有効 → Entra access で再交換
 /// 3. Splunk token 失効 & Entra access も失効 & refresh token あり → Entra refresh → 新 Entra access で再交換
 ///
 /// いずれも失敗、または refresh token が無ければエラー（再ログインを促す）。
-/// 更新が起きた場合は `updated=true` を返し、呼び出し側が store へ書き戻す。
+///
+/// 重要: Entra refresh に成功した後で Splunk 交換が失敗した場合でも、
+/// refresh で得た新しい Entra access / refresh token はエラーに添えて返す
+/// （`RefreshErr::partial`）。呼び出し側はそれを store に書き戻すことで、
+/// 次回の再 refresh の無駄と（ローテーション時の）refresh token 喪失を防げる。
 pub async fn ensure_fresh_session(
     session: &OAuthSession,
     cfg: &OAuthConfig,
     base_url: &str,
     http: &reqwest::Client,
-) -> Result<(OAuthSession, bool)> {
+) -> std::result::Result<Refreshed, RefreshErr> {
     let now = now_unix();
     if !session.splunk_expired(now) {
-        return Ok((session.clone(), false));
+        return Ok(Refreshed {
+            session: session.clone(),
+            changed: false,
+        });
     }
 
     let mut next = session.clone();
+    // Entra を refresh したかどうか（交換失敗時に部分的前進を返すため記録）。
+    let mut entra_refreshed = false;
 
     // Entra access が失効していれば refresh で更新する。
     if next.entra_expired(now) {
         let Some(rt) = next.refresh_token.clone() else {
-            return Err(SplunkError::Auth(
-                "Splunk token expired and no refresh token is stored. Run `auth login` again."
-                    .to_string(),
-            ));
+            return Err(RefreshErr {
+                error: SplunkError::Auth(
+                    "Splunk token expired and no refresh token is stored. \
+Run `auth login` again."
+                        .to_string(),
+                ),
+                partial: None,
+            });
         };
-        let refreshed = refresh(cfg, http, &rt).await?;
+        let refreshed = match refresh(cfg, http, &rt).await {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(RefreshErr {
+                    error: e,
+                    partial: None,
+                })
+            }
+        };
         next.entra_access_token = refreshed.access_token;
         next.entra_expires_at = refreshed.expires_at;
         // Entra が refresh token をローテーションしたら更新、しなければ既存を維持。
         if refreshed.refresh_token.is_some() {
             next.refresh_token = refreshed.refresh_token;
         }
+        entra_refreshed = true;
     }
 
     // Entra access token を Splunk token に交換する。
     let splunk =
-        exchange_for_splunk_token(base_url, &cfg.client_id, http, &next.entra_access_token).await?;
+        match exchange_for_splunk_token(base_url, &cfg.client_id, http, &next.entra_access_token)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                // 交換は失敗したが、Entra を refresh して前進した場合は、その
+                // 中間セッションをエラーに添えて返す（呼び出し側が保存できる）。
+                return Err(RefreshErr {
+                    error: e,
+                    partial: entra_refreshed.then_some(next),
+                });
+            }
+        };
     next.splunk_token = splunk.access_token;
     next.splunk_expires_at = splunk.expires_at;
 
-    Ok((next, true))
+    Ok(Refreshed {
+        session: next,
+        changed: true,
+    })
+}
+
+/// `ensure_fresh_session` の失敗。`partial` には、エラーまでに前進した
+/// 中間セッション（Entra refresh は成功したが Splunk 交換が失敗した等）を入れる。
+/// 呼び出し側は `partial` を store に書き戻してから `error` を伝播してよい。
+pub struct RefreshErr {
+    pub error: SplunkError,
+    pub partial: Option<OAuthSession>,
 }
 
 /// Entra ID の access token (JWT) を Splunk access token に交換する。
@@ -494,10 +547,12 @@ pub async fn exchange_for_splunk_token(
             expires_at: expires_at_from(tr.expires_in.unwrap_or(3600), now_unix()),
         })
     } else {
-        // エラー本文に Entra JWT は含まれないが、Splunk のメッセージのみ抜き出す。
+        // エラー本文から Splunk のメッセージを短く抜き出す。
+        // 注意: 交換リクエストは `client_assertion`（Entra JWT）を送るため、
+        // サーバが受信値をエコーする実装だとエラー本文に JWT 断片が混じる可能性が
+        // ある（サーバ挙動依存）。ここでは長さを絞るに留め、断定はしない。
         let msg = String::from_utf8_lossy(&body);
-        let mut snippet = msg.into_owned();
-        snippet.truncate(200);
+        let snippet = crate::util::truncate_chars(&msg, 200);
         Err(SplunkError::Auth(format!(
             "Splunk token exchange failed (http {}): {}",
             status.as_u16(),
