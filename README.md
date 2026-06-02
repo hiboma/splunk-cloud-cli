@@ -191,7 +191,7 @@ macOS shows an access-prompt dialog the first time the binary reads a Keychain e
 
 ### Sign in with Entra ID (OAuth device code flow)
 
-Instead of pasting a long-lived token, you can sign in interactively against Microsoft Entra ID. The CLI runs the OAuth 2.0 **device code flow**: it prints a short code, you approve it in a browser, and the CLI stores the resulting JWT access token (plus a refresh token) in the OS credential store. Splunk Cloud is configured to validate that JWT as a Bearer token — the CLI never sees your password.
+Instead of pasting a long-lived token, you can sign in interactively against Microsoft Entra ID. The CLI runs the OAuth 2.0 **device code flow**: it prints a short code, opens the sign-in page in your browser automatically (falling back to a printed URL if it can't), you approve the code, and the CLI stores the resulting JWT access token (plus a refresh token) in the OS credential store. Splunk Cloud is configured to validate that JWT as a Bearer token — the CLI never sees your password.
 
 This requires an Entra ID app registration with a public client (device code) enabled, and a matching OAuth 2.0 configuration on the Splunk Cloud side. Put the (non-secret) tenant and client identifiers in the config file:
 

@@ -57,13 +57,18 @@ async fn login(settings: &Settings, store: &dyn CredentialStore) -> Result<()> {
 
     // ブラウザ案内は標準エラーへ出す。標準出力は機械可読な結果のために空けておく。
     let on_prompt = |p: &UserPrompt| {
-        if let Some(msg) = &p.message {
-            eprintln!("{}", msg);
-        } else {
-            eprintln!(
-                "To sign in, open {} and enter the code {}",
-                p.verification_uri, p.user_code
-            );
+        eprintln!();
+        eprintln!("To sign in, open this page in a browser:");
+        eprintln!("    {}", p.verification_uri);
+        eprintln!();
+        eprintln!("and enter this code:");
+        eprintln!();
+        eprintln!("    {}", emphasize_code(&p.user_code));
+        eprintln!();
+
+        // ブラウザを自動で開く。失敗しても上の手動手順が残るので無視する。
+        if open_in_browser(&p.verification_uri) {
+            eprintln!("(opened the page in your browser)");
         }
         eprintln!("Waiting for you to complete sign-in in the browser...");
     };
@@ -73,6 +78,56 @@ async fn login(settings: &Settings, store: &dyn CredentialStore) -> Result<()> {
 
     eprintln!("Signed in. Access token stored in the OS credential store.");
     Ok(())
+}
+
+/// user_code を目立たせる。stderr が端末なら ANSI の太字＋黄色で強調し、
+/// パイプ・リダイレクト時（非 TTY）は装飾なしの素の文字列にする。
+fn emphasize_code(code: &str) -> String {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        // 1 = bold, 33 = yellow。0 でリセット。
+        format!("\x1b[1;33m{}\x1b[0m", code)
+    } else {
+        code.to_string()
+    }
+}
+
+/// `verification_uri` を OS のデフォルトブラウザで開く。開けたら true。
+///
+/// shell を介さず `Command` で直接プログラムを起動し、URL は引数として渡す。
+/// これにより、URL に shell メタ文字が含まれても解釈されない（インジェクション対策）。
+/// 失敗しても呼び出し側は手動手順を表示済みなので、ここでは握り潰す。
+fn open_in_browser(url: &str) -> bool {
+    use std::process::{Command, Stdio};
+
+    // 各 OS のブラウザ起動コマンド。引数として URL を渡す（shell 不使用）。
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        // `cmd /c start "" <url>` 形式。空タイトルでウィンドウタイトル誤認を防ぐ。
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+
+    // 出力は端末を汚さないよう捨てる。
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    // status() は子プロセスの終了を待つ。open / xdg-open は即座に return する。
+    matches!(cmd.status(), Ok(s) if s.success())
 }
 
 fn logout(store: &dyn CredentialStore) -> Result<()> {
