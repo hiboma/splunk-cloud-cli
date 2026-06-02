@@ -15,20 +15,23 @@ use std::fmt;
 pub const SERVICE: &str = "dev.splunk-cloud-cli";
 
 /// Bearer token を格納するエントリのキー。
-/// OAuth (Device Code) フローで得た access token もここに保存する。
+/// `credentials set token` で手動投入した Bearer token を保持する。
+/// （OAuth ログインで得たトークンは `oauth_session` 側に集約する。）
 pub const KEY_TOKEN: &str = "token";
 /// Splunk session key を格納するエントリのキー。
 pub const KEY_SESSION_KEY: &str = "session_key";
 /// Basic 認証用パスワードを格納するエントリのキー。
 pub const KEY_PASSWORD: &str = "password";
-/// OAuth refresh token を格納するエントリのキー（長期有効な秘密値）。
-pub const KEY_REFRESH_TOKEN: &str = "refresh_token";
-/// access token の失効 UNIX 時刻（秒）を格納するエントリのキー。
-/// 値そのものは秘密ではないが、token と寿命を同じストアで管理するためここに置く。
-pub const KEY_TOKEN_EXPIRY: &str = "token_expiry";
+/// `auth login` の OAuth セッション一式（JSON）を格納する単一エントリのキー。
+///
+/// Splunk token / その失効時刻 / Entra access token / その失効時刻 / Entra
+/// refresh token を 1 つの JSON 値にまとめて保存する。複数エントリに分けると
+/// macOS Keychain のアクセス許可ダイアログが値ごとに出て煩雑になるため、
+/// 1 エントリに集約して読み書きを 1 回のアクセスにまとめる。
+pub const KEY_OAUTH_SESSION: &str = "oauth_session";
 
 /// `credentials` サブコマンドが set/delete/status で扱う 3 フィールド。
-/// OAuth 由来の refresh_token / token_expiry は `auth login` / `auth logout` が
+/// OAuth セッション（`oauth_session`）は `auth login` / `auth logout` が
 /// 管理するため、ここには含めない。
 pub const KNOWN_KEYS: &[&str] = &[KEY_TOKEN, KEY_SESSION_KEY, KEY_PASSWORD];
 

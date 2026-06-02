@@ -16,7 +16,7 @@
 //!   - エンドポイントはすべて `https://login.microsoftonline.com` 配下（TLS）。
 
 use crate::error::{Result, SplunkError};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 失効間近とみなす安全マージン（秒）。サーバとのクロックずれや
@@ -297,6 +297,211 @@ pub async fn refresh(
             err.error,
             err.error_description
                 .unwrap_or_else(|| "run `auth login` again".to_string())
+        )))
+    }
+}
+
+/// Splunk が交換で発行した access token。`token_type` は通常 "Bearer"。
+///
+/// `Debug` は派生しない。`access_token` は秘密値。
+#[derive(Clone)]
+pub struct SplunkToken {
+    pub access_token: String,
+    pub expires_at: u64,
+}
+
+impl std::fmt::Debug for SplunkToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SplunkToken")
+            .field("access_token", &"***")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl SplunkToken {
+    pub fn is_expired(&self, now: u64) -> bool {
+        now.saturating_add(EXPIRY_SKEW_SECS) >= self.expires_at
+    }
+}
+
+/// `POST /token` の交換レスポンス。
+#[derive(Deserialize)]
+struct SplunkTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+/// `auth login` の OAuth セッション一式。credential store に 1 つの JSON
+/// エントリ（`oauth_session`）として保存し、Keychain アクセスを 1 回にまとめる。
+///
+/// `Debug` / `Display` は実装しない。`splunk_token` / `entra_access_token` /
+/// `refresh_token` は秘密値であり、`{:?}` 経由でも展開させない。
+/// JSON シリアライズはストア保存専用に使う（ログ等には出さない）。
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OAuthSession {
+    /// REST API に Bearer で送る Splunk 発行トークン。
+    pub splunk_token: String,
+    /// Splunk token の失効 UNIX 時刻（秒）。
+    pub splunk_expires_at: u64,
+    /// Entra ID の access token（JWT）。Splunk token 再交換の client_assertion。
+    pub entra_access_token: String,
+    /// Entra access token の失効 UNIX 時刻（秒）。
+    pub entra_expires_at: u64,
+    /// Entra ID の refresh token。Entra access も失効したときの再取得に使う。
+    /// 取得できなかった場合は None。
+    pub refresh_token: Option<String>,
+}
+
+impl std::fmt::Debug for OAuthSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthSession")
+            .field("splunk_token", &"***")
+            .field("splunk_expires_at", &self.splunk_expires_at)
+            .field("entra_access_token", &"***")
+            .field("entra_expires_at", &self.entra_expires_at)
+            .field(
+                "refresh_token",
+                &if self.refresh_token.is_some() {
+                    "Some(***)"
+                } else {
+                    "None"
+                },
+            )
+            .finish()
+    }
+}
+
+impl OAuthSession {
+    /// device code ログインで得た Entra トークンと交換後の Splunk トークンから組む。
+    pub fn from_login(entra: &TokenSet, splunk: &SplunkToken) -> Self {
+        Self {
+            splunk_token: splunk.access_token.clone(),
+            splunk_expires_at: splunk.expires_at,
+            entra_access_token: entra.access_token.clone(),
+            entra_expires_at: entra.expires_at,
+            refresh_token: entra.refresh_token.clone(),
+        }
+    }
+
+    /// JSON 文字列へ（ストア保存用）。
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string(self).map_err(SplunkError::from)
+    }
+
+    /// JSON 文字列から復元（ストア読み出し用）。
+    pub fn from_json(s: &str) -> Result<Self> {
+        serde_json::from_str(s).map_err(SplunkError::from)
+    }
+
+    /// Splunk token が（安全マージン込みで）失効しているか。
+    pub fn splunk_expired(&self, now: u64) -> bool {
+        now.saturating_add(EXPIRY_SKEW_SECS) >= self.splunk_expires_at
+    }
+
+    /// Entra access token が（安全マージン込みで）失効しているか。
+    pub fn entra_expired(&self, now: u64) -> bool {
+        now.saturating_add(EXPIRY_SKEW_SECS) >= self.entra_expires_at
+    }
+}
+
+/// Splunk token を有効な状態にして返す。必要なら 3 段階で更新する。
+///
+/// 1. Splunk token が有効 → そのまま返す（更新なし、`updated=false`）
+/// 2. Splunk token 失効 & Entra access 有効 → Entra access で再交換
+/// 3. Splunk token 失効 & Entra access も失効 & refresh token あり → Entra refresh → 新 Entra access で再交換
+///
+/// いずれも失敗、または refresh token が無ければエラー（再ログインを促す）。
+/// 更新が起きた場合は `updated=true` を返し、呼び出し側が store へ書き戻す。
+pub async fn ensure_fresh_session(
+    session: &OAuthSession,
+    cfg: &OAuthConfig,
+    base_url: &str,
+    http: &reqwest::Client,
+) -> Result<(OAuthSession, bool)> {
+    let now = now_unix();
+    if !session.splunk_expired(now) {
+        return Ok((session.clone(), false));
+    }
+
+    let mut next = session.clone();
+
+    // Entra access が失効していれば refresh で更新する。
+    if next.entra_expired(now) {
+        let Some(rt) = next.refresh_token.clone() else {
+            return Err(SplunkError::Auth(
+                "Splunk token expired and no refresh token is stored. Run `auth login` again."
+                    .to_string(),
+            ));
+        };
+        let refreshed = refresh(cfg, http, &rt).await?;
+        next.entra_access_token = refreshed.access_token;
+        next.entra_expires_at = refreshed.expires_at;
+        // Entra が refresh token をローテーションしたら更新、しなければ既存を維持。
+        if refreshed.refresh_token.is_some() {
+            next.refresh_token = refreshed.refresh_token;
+        }
+    }
+
+    // Entra access token を Splunk token に交換する。
+    let splunk =
+        exchange_for_splunk_token(base_url, &cfg.client_id, http, &next.entra_access_token).await?;
+    next.splunk_token = splunk.access_token;
+    next.splunk_expires_at = splunk.expires_at;
+
+    Ok((next, true))
+}
+
+/// Entra ID の access token (JWT) を Splunk access token に交換する。
+///
+/// Splunk Cloud の OAuth 2.0 external application server は外部 IdP の JWT を
+/// REST API で直接受理せず、まず `oauth2/v1/token` で「Splunk 発行トークン」へ
+/// 交換する必要がある。交換は Client Credentials Grant + JWT client assertion
+/// 方式で、Entra JWT を `client_assertion` として渡す（Authorization ヘッダは
+/// 付けない。エンドポイントは client_assertion で認証する public endpoint）。
+///
+/// `base_url` は Splunk の接続先（例: `https://<stack>.splunkcloud.com:8089`）。
+/// 交換エンドポイントは `/oauth2/v1/token`（`/services` プレフィックスなし）。
+pub async fn exchange_for_splunk_token(
+    base_url: &str,
+    client_id: &str,
+    http: &reqwest::Client,
+    entra_jwt: &str,
+) -> Result<SplunkToken> {
+    let url = format!("{}/oauth2/v1/token", base_url.trim_end_matches('/'));
+    let resp = http
+        .post(&url)
+        .form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", client_id),
+            (
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ),
+            ("client_assertion", entra_jwt),
+        ])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body = resp.bytes().await?;
+    if status.is_success() {
+        let tr: SplunkTokenResponse = serde_json::from_slice(&body)?;
+        Ok(SplunkToken {
+            access_token: tr.access_token,
+            // expires_in が無ければ控えめに 1 時間とみなす（Splunk の既定）。
+            expires_at: expires_at_from(tr.expires_in.unwrap_or(3600), now_unix()),
+        })
+    } else {
+        // エラー本文に Entra JWT は含まれないが、Splunk のメッセージのみ抜き出す。
+        let msg = String::from_utf8_lossy(&body);
+        let mut snippet = msg.into_owned();
+        snippet.truncate(200);
+        Err(SplunkError::Auth(format!(
+            "Splunk token exchange failed (http {}): {}",
+            status.as_u16(),
+            snippet
         )))
     }
 }
