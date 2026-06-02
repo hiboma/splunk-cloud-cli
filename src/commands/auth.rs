@@ -57,19 +57,32 @@ async fn login(settings: &Settings, store: &dyn CredentialStore) -> Result<()> {
 
     // ブラウザ案内は標準エラーへ出す。標準出力は機械可読な結果のために空けておく。
     let on_prompt = |p: &UserPrompt| {
+        use std::io::IsTerminal;
+
         eprintln!();
-        eprintln!("To sign in, open this page in a browser:");
-        eprintln!("    {}", p.verification_uri);
-        eprintln!();
-        eprintln!("and enter this code:");
+        eprintln!("Your one-time code is:");
         eprintln!();
         eprintln!("    {}", emphasize_code(&p.user_code));
         eprintln!();
 
-        // ブラウザを自動で開く。失敗しても上の手動手順が残るので無視する。
-        if open_in_browser(&p.verification_uri) {
-            eprintln!("(opened the page in your browser)");
+        // 対話端末では、まず code を確認させてから Enter でブラウザを開く。
+        // 非対話（パイプ / CI）では Enter 待ちもブラウザ起動もせず、URL を
+        // 表示してそのままポーリングに入る（スクリプトでブロックしない）。
+        let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+        if interactive {
+            eprint!("Press Enter to open the sign-in page in your browser (or open it yourself): ");
+            wait_for_enter();
+            if open_in_browser(&p.verification_uri) {
+                eprintln!("Opened: {}", p.verification_uri);
+            } else {
+                eprintln!("Could not open a browser. Open this page manually:");
+                eprintln!("    {}", p.verification_uri);
+            }
+        } else {
+            eprintln!("To sign in, open this page in a browser and enter the code above:");
+            eprintln!("    {}", p.verification_uri);
         }
+        eprintln!();
         eprintln!("Waiting for you to complete sign-in in the browser...");
     };
 
@@ -78,6 +91,14 @@ async fn login(settings: &Settings, store: &dyn CredentialStore) -> Result<()> {
 
     eprintln!("Signed in. Access token stored in the OS credential store.");
     Ok(())
+}
+
+/// 標準入力から 1 行（Enter まで）を読み捨てる。対話端末でのみ呼ぶ。
+/// EOF や読み取りエラーでもブロックせずに戻る。
+fn wait_for_enter() {
+    use std::io::BufRead;
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
 }
 
 /// user_code を目立たせる。stderr が端末なら ANSI の太字＋黄色で強調し、

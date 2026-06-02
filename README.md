@@ -191,7 +191,9 @@ macOS shows an access-prompt dialog the first time the binary reads a Keychain e
 
 ### Sign in with Entra ID (OAuth device code flow)
 
-Instead of pasting a long-lived token, you can sign in interactively against Microsoft Entra ID. The CLI runs the OAuth 2.0 **device code flow**: it prints a short code, opens the sign-in page in your browser automatically (falling back to a printed URL if it can't), you approve the code, and the CLI stores the resulting JWT access token (plus a refresh token) in the OS credential store. Splunk Cloud is configured to validate that JWT as a Bearer token — the CLI never sees your password.
+Instead of pasting a long-lived token, you can sign in interactively against Microsoft Entra ID. The CLI runs the OAuth 2.0 **device code flow**: it shows a short one-time code, then (on a terminal) waits for you to press Enter and opens the sign-in page in your browser; you enter the code and approve. The CLI stores the resulting JWT access token (plus a refresh token) in the OS credential store. Splunk Cloud is configured to validate that JWT as a Bearer token — the CLI never sees your password.
+
+When stdout/stdin are not a terminal (piped or CI), the CLI does not wait or open a browser: it prints the URL and code and proceeds to poll, so scripts don't block.
 
 This requires an Entra ID app registration with a public client (device code) enabled, and a matching OAuth 2.0 configuration on the Splunk Cloud side. Put the (non-secret) tenant and client identifiers in the config file:
 
@@ -208,7 +210,7 @@ oauth_client_id = "325df464-153b-4bc5-adac-7e5014b58bb4"
 These three can also come from `SPLUNK_OAUTH_TENANT_ID` / `SPLUNK_OAUTH_CLIENT_ID` / `SPLUNK_OAUTH_SCOPE`. They are not secrets, so unlike the auth fields they may live in the config file or env without special handling.
 
 ```bash
-# Sign in. Follow the printed URL + code in a browser, then approve.
+# Sign in. Shows a code, then opens the browser on Enter. Approve there.
 splunk-cloud-cli auth login
 
 # Use the CLI as usual — the stored token is picked up automatically.
