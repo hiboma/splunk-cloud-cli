@@ -174,32 +174,28 @@ fn sanitize_server_text(s: &str, max: usize) -> String {
 
 /// `eyJ` で始まる JWT 様トークン（`header.payload.signature` の 3 セグメント、
 /// 各セグメントは base64url 文字）を `***` に置き換える。
+///
+/// 空白で語に分け、各語の前後にある引用符・記号（`"` や `,` 等）は保ったまま、
+/// 中央の JWT 部分だけを伏せる。JWT のセグメント区切りは `.` なので、`.` は
+/// b64url 文字に含めて 1 語として扱い、`eyJ` 始まり・ドット 2 個で判定する。
 fn mask_jwt_like(s: &str) -> String {
-    fn is_b64url(c: char) -> bool {
-        c.is_ascii_alphanumeric() || c == '-' || c == '_'
+    // JWT 本体を構成しうる文字（base64url + セグメント区切りの `.`）。
+    fn is_jwt_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
     }
-    // 空白・引用符・カンマなどトークンの区切りで分割し、各トークンを検査する。
-    s.split_inclusive(|c: char| c.is_whitespace())
-        .map(|chunk| {
-            // chunk 末尾の区切り空白は残し、語の部分だけ判定する。
-            let (word, trailing) =
-                match chunk.char_indices().rev().find(|(_, c)| !c.is_whitespace()) {
-                    Some((i, c)) => chunk.split_at(i + c.len_utf8()),
-                    None => (chunk, ""),
-                };
-            // 語の前後にある引用符・記号は保ちつつ、中の JWT 様部分だけ伏せる。
-            let lead_len = word.len() - word.trim_start_matches(|c| !is_b64url(c)).len();
-            let (lead, rest) = word.split_at(lead_len);
-            let core_len = rest.trim_end_matches(|c| !is_b64url(c)).len();
-            let (core, tail) = rest.split_at(core_len);
-            let replaced = if core.starts_with("eyJ") && core.matches('.').count() == 2 {
-                "***"
+    let masked: Vec<String> = s
+        .split_whitespace()
+        .map(|word| {
+            let core = word.trim_matches(|c: char| !is_jwt_char(c));
+            if core.starts_with("eyJ") && core.matches('.').count() == 2 {
+                // 前後の記号（引用符等）は残し、芯だけ伏せる。
+                word.replacen(core, "***", 1)
             } else {
-                core
-            };
-            format!("{}{}{}{}", lead, replaced, tail, trailing)
+                word.to_string()
+            }
         })
-        .collect()
+        .collect();
+    masked.join(" ")
 }
 
 // --- PKCE ---
@@ -295,7 +291,8 @@ pub type PromptFn<'a> = dyn Fn(&UserPrompt) + Send + Sync + 'a;
 /// 1. PKCE（state / code_verifier / code_challenge）を生成する
 /// 2. loopback（`127.0.0.1:REDIRECT_PORT`）に redirect 受け口を bind する
 /// 3. `on_prompt` で authorize URL をユーザーに提示する（ブラウザ起動）
-/// 4. ブラウザが redirect してくる `code` / `state` を 1 リクエストだけ受ける
+/// 4. ブラウザが redirect してくる認可レスポンス（`code` / `state`）を受ける
+///    （favicon 取得などの無関係な接続は読み飛ばす）
 /// 5. `state` を定数時間比較で検証し、`code` + `code_verifier` をトークンに交換する
 ///
 /// `AUTH_WAIT_SECS` を過ぎても redirect が来なければタイムアウトする。
@@ -319,20 +316,44 @@ Another process may be using the port; close it and retry `auth login`.",
             ))
         })?;
 
-    let authorize_url = build_authorize_url(cfg, &redirect_uri, &pkce);
+    run_authorization_code_flow(
+        &cfg.token_url(),
+        cfg,
+        &listener,
+        &redirect_uri,
+        &pkce,
+        Duration::from_secs(AUTH_WAIT_SECS),
+        http,
+        on_prompt,
+    )
+    .await
+}
+
+/// `authorization_code_login` の本体。bind 済みの `listener`・token エンドポイント・
+/// 待機時間を引数で受けることで、本番（固定ポート・ホスト固定・5 分待ち）と
+/// テスト（任意ポート・mockito・短い待ち）で同じ制御フローを通す。
+#[allow(clippy::too_many_arguments)]
+async fn run_authorization_code_flow(
+    token_endpoint: &str,
+    cfg: &OAuthConfig,
+    listener: &TcpListener,
+    redirect_uri: &str,
+    pkce: &PkceParams,
+    wait: Duration,
+    http: &reqwest::Client,
+    on_prompt: &PromptFn<'_>,
+) -> Result<TokenSet> {
+    let authorize_url = build_authorize_url(cfg, redirect_uri, pkce);
     on_prompt(&UserPrompt {
         authorize_url: authorize_url.clone(),
     });
 
-    // redirect を 1 リクエストだけ受ける。タイムアウト付き。
-    let callback = tokio::time::timeout(
-        Duration::from_secs(AUTH_WAIT_SECS),
-        accept_callback(&listener),
-    )
-    .await
-    .map_err(|_| {
-        SplunkError::Auth("timed out waiting for the browser to complete sign-in".to_string())
-    })??;
+    // 認可 redirect を受ける。タイムアウト付き（放置時のハングを防ぐ）。
+    let callback = tokio::time::timeout(wait, accept_callback(listener))
+        .await
+        .map_err(|_| {
+            SplunkError::Auth("timed out waiting for the browser to complete sign-in".to_string())
+        })??;
 
     // CSRF / レスポンス取り違え対策: state を定数時間比較する。
     if !constant_time_eq(callback.state.as_bytes(), pkce.state.as_bytes()) {
@@ -356,7 +377,15 @@ Another process may be using the port; close it and retry `auth login`.",
         SplunkError::Auth("authorization response did not contain a code".to_string())
     })?;
 
-    exchange_authorization_code(cfg, http, &code, &redirect_uri, &pkce.code_verifier).await
+    exchange_authorization_code_to(
+        token_endpoint,
+        cfg,
+        http,
+        &code,
+        redirect_uri,
+        &pkce.code_verifier,
+    )
+    .await
 }
 
 /// authorize エンドポイントの URL を組み立てる。
@@ -380,27 +409,9 @@ fn build_authorize_url(cfg: &OAuthConfig, redirect_uri: &str, pkce: &PkceParams)
     format!("{}?{}", cfg.authorize_url(), query)
 }
 
-/// authorization_code grant でトークンに交換する。
-async fn exchange_authorization_code(
-    cfg: &OAuthConfig,
-    http: &reqwest::Client,
-    code: &str,
-    redirect_uri: &str,
-    code_verifier: &str,
-) -> Result<TokenSet> {
-    exchange_authorization_code_to(
-        &cfg.token_url(),
-        cfg,
-        http,
-        code,
-        redirect_uri,
-        code_verifier,
-    )
-    .await
-}
-
-/// `exchange_authorization_code` の本体。token エンドポイントを引数で受けることで、
-/// 本番（ホスト固定）とテスト（mockito の base URL）で同じ送信ロジックを通す。
+/// authorization_code grant でトークンに交換する。token エンドポイントを引数で
+/// 受けることで、本番（`run_authorization_code_flow` が `cfg.token_url()` を渡す）と
+/// テスト（mockito の base URL）で同じ送信ロジックを通す。
 async fn exchange_authorization_code_to(
     token_endpoint: &str,
     cfg: &OAuthConfig,
@@ -1418,13 +1429,176 @@ mod tests {
         assert_eq!(out, "invalid_grant: code already redeemed");
     }
 
-    // noop_prompt はサーバ起動を伴う login の単体テストで使う想定。現状の
-    // テストは accept_callback を直接叩くため未使用だが、将来の結線テスト用に残す。
-    #[test]
-    fn prompt_callback_is_constructible() {
-        let p = noop_prompt();
-        p(&UserPrompt {
-            authorize_url: "https://example/authorize".into(),
+    // --- run_authorization_code_flow の結線テスト ---
+    //
+    // 任意ポートで bind した listener と mockito の token エンドポイント、短い
+    // 待機時間を注入し、本体の各分岐（成功 / authorize エラー / code 欠落 /
+    // state 不一致 / タイムアウト）を本番制御フローのまま検証する。
+
+    fn fixed_pkce(state: &str) -> PkceParams {
+        PkceParams {
+            state: state.into(),
+            code_verifier: "VERIFIER".into(),
+            code_challenge: "CHALLENGE".into(),
+        }
+    }
+
+    /// listener へ「ブラウザの redirect」を模した HTTP リクエストを 1 本送る。
+    fn spawn_redirect(addr: std::net::SocketAddr, request_line: &'static str) {
+        tokio::spawn(async move {
+            let Ok(mut s) = TcpStream::connect(addr).await else {
+                return;
+            };
+            let req = format!("{}\r\nHost: 127.0.0.1\r\n\r\n", request_line);
+            let _ = s.write_all(req.as_bytes()).await;
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf).await;
         });
+    }
+
+    #[tokio::test]
+    async fn flow_succeeds_end_to_end() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/token")
+            .match_body(mockito::Matcher::UrlEncoded(
+                "code".into(),
+                "REALCODE".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#)
+            .create_async()
+            .await;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_redirect(addr, "GET /callback?code=REALCODE&state=S HTTP/1.1");
+
+        let http = reqwest::Client::new();
+        let prompt = noop_prompt();
+        let tok = run_authorization_code_flow(
+            &format!("{}/token", server.url()),
+            &test_cfg(),
+            &listener,
+            "http://127.0.0.1:49873/callback",
+            &fixed_pkce("S"),
+            Duration::from_secs(5),
+            &http,
+            &*prompt,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tok.access_token, "AT");
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn flow_rejects_state_mismatch() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // redirect は state=WRONG を返す。期待 state は "EXPECTED"。
+        spawn_redirect(addr, "GET /callback?code=C&state=WRONG HTTP/1.1");
+
+        let http = reqwest::Client::new();
+        let prompt = noop_prompt();
+        let err = run_authorization_code_flow(
+            "http://unused.invalid/token",
+            &test_cfg(),
+            &listener,
+            "http://127.0.0.1:49873/callback",
+            &fixed_pkce("EXPECTED"),
+            Duration::from_secs(5),
+            &http,
+            &*prompt,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("state did not match"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn flow_surfaces_authorize_error() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_redirect(
+            addr,
+            "GET /callback?error=access_denied&error_description=user%20declined&state=S HTTP/1.1",
+        );
+
+        let http = reqwest::Client::new();
+        let prompt = noop_prompt();
+        let err = run_authorization_code_flow(
+            "http://unused.invalid/token",
+            &test_cfg(),
+            &listener,
+            "http://127.0.0.1:49873/callback",
+            &fixed_pkce("S"),
+            Duration::from_secs(5),
+            &http,
+            &*prompt,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("access_denied"), "got: {}", msg);
+        assert!(msg.contains("user declined"), "got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn flow_surfaces_empty_error_param() {
+        // `error=`（空文字）は authorize エラー分岐で拾われる。
+        //
+        // なお `code` も `error` も無い応答は `accept_callback` がスキップして
+        // 待ち続けるため、本体の `code` 欠落分岐（"did not contain a code"）には
+        // 通常到達しない。その分岐は防御的な保険として残してある。
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_redirect(addr, "GET /callback?error=&state=S HTTP/1.1");
+
+        let http = reqwest::Client::new();
+        let prompt = noop_prompt();
+        let err = run_authorization_code_flow(
+            "http://unused.invalid/token",
+            &test_cfg(),
+            &listener,
+            "http://127.0.0.1:49873/callback",
+            &fixed_pkce("S"),
+            Duration::from_secs(5),
+            &http,
+            &*prompt,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("authorization failed"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn flow_times_out_without_redirect() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        // redirect を一切送らない。短い wait で即タイムアウトさせる。
+        let http = reqwest::Client::new();
+        let prompt = noop_prompt();
+        let err = run_authorization_code_flow(
+            "http://unused.invalid/token",
+            &test_cfg(),
+            &listener,
+            "http://127.0.0.1:49873/callback",
+            &fixed_pkce("S"),
+            Duration::from_millis(50),
+            &http,
+            &*prompt,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "got: {}", err);
     }
 }
