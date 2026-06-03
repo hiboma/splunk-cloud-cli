@@ -70,7 +70,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Authentication: OAuth device-code login/logout/status and whoami.
+    /// Authentication: OAuth authorization-code login/logout/status and whoami.
     #[command(subcommand)]
     Auth(AuthCmd),
 
@@ -182,18 +182,17 @@ impl CredentialField {
 pub enum AuthCmd {
     /// Show current authentication context via `/services/authentication/current-context`.
     Whoami,
-    /// Sign in to Entra ID via the OAuth 2.0 device code flow and store the
-    /// resulting access/refresh token in the OS credential store.
+    /// Sign in to Entra ID via the OAuth 2.0 authorization code flow with PKCE
+    /// and store the resulting access/refresh token in the OS credential store.
+    ///
+    /// Opens a browser and receives the authorization code on a loopback
+    /// redirect (`http://127.0.0.1:49873/callback`). Register that redirect URI
+    /// on the Entra app registration as a "Mobile and desktop applications"
+    /// redirect.
     ///
     /// Requires `oauth_tenant_id` / `oauth_client_id` in the config file
     /// (or `SPLUNK_OAUTH_TENANT_ID` / `SPLUNK_OAUTH_CLIENT_ID`).
-    Login {
-        /// Copy the one-time device code to the clipboard. The code is not a
-        /// secret (it is meant to be typed into the browser); only the code is
-        /// copied, never the access/refresh token. macOS only for now.
-        #[arg(long)]
-        copy: bool,
-    },
+    Login,
     /// Remove the stored OAuth access token, refresh token, and expiry.
     Logout,
     /// Show whether an OAuth token is stored and how long it remains valid.

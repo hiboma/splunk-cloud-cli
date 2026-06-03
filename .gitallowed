@@ -3,3 +3,8 @@
 ^\*\.pem$
 "pin-project-lite"
 "tower-service"
+# oauth.rs の mask_jwt_like テストで使うダミー JWT。中身は {"alg":"HS256"} /
+# {"sub":"1"} と明らかなサンプルで、秘密値ではない。完全 JWT 行・header 単体行の
+# どちらもこの header 文字列を含むため、これ一つで両方の検出を許可できる。本物の
+# JWT 検出は維持する。
+eyJhbGciOiJIUzI1NiJ9
