@@ -40,6 +40,13 @@ thiserror = "2"
 urlencoding = "2"
 dirs = "6"
 rpassword = "7"
+# Authorization Code + PKCE 用。code_verifier の SHA-256 → base64url で
+# code_challenge を作り、認可コードを横取りされても token 交換できないようにする。
+# base64 / rand は既に依存ツリーに居る（transitive）ので直接依存へ格上げするだけ。
+# sha2 のみ新規追加。
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }
