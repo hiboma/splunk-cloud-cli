@@ -69,7 +69,7 @@ token        = "eyJEXAMPLEHEADER00.eyJEXAMPLEPAYLOAD0.EXAMPLESIGN0"   # Bearer t
 # username   = "admin"                      # Basic auth
 # password   = "..."
 
-# Or sign in interactively with `auth login` (Entra ID device code flow).
+# Or sign in interactively with `auth login` (Entra ID authorization code + PKCE).
 # These identifiers are not secrets. See "Sign in with Entra ID" below.
 # oauth_tenant_id = "a271068e-1b87-40f0-a7f2-f9c9624e3f7c"
 # oauth_client_id = "325df464-153b-4bc5-adac-7e5014b58bb4"
@@ -189,15 +189,15 @@ security delete-generic-password -s dev.splunk-cloud-cli -a token
 
 macOS shows an access-prompt dialog the first time the binary reads a Keychain entry. Choosing **Always Allow** suppresses subsequent prompts. The dialog reappears whenever the binary's code signature changes (e.g. after `cargo install` rebuilds the binary).
 
-### Sign in with Entra ID (OAuth device code flow)
+### Sign in with Entra ID (OAuth authorization code + PKCE)
 
-Instead of pasting a long-lived token, you can sign in interactively against Microsoft Entra ID. The CLI runs the OAuth 2.0 **device code flow**: it shows a short one-time code, then (on a terminal) waits for you to press Enter and opens the sign-in page in your browser; you enter the code and approve. The CLI never sees your password.
+Instead of pasting a long-lived token, you can sign in interactively against Microsoft Entra ID. The CLI runs the OAuth 2.0 **authorization code flow with PKCE** (RFC 7636): it opens the sign-in page in your browser and receives the authorization code on a loopback redirect (`http://127.0.0.1:49873/callback`). PKCE means an intercepted authorization code is useless without the code verifier held only by the CLI, and receiving the code on a loopback redirect avoids the device-code phishing class entirely. The CLI never sees your password.
 
-Splunk Cloud does **not** accept the Entra ID JWT directly on the REST API — it issues its own tokens. So after the device code flow, the CLI exchanges the Entra JWT for a Splunk access token via the Splunk token endpoint (`oauth2/v1/token`, using the JWT as a `client_assertion`), and stores that Splunk token. Subsequent REST calls send the Splunk token as a Bearer token.
+Splunk Cloud does **not** accept the Entra ID JWT directly on the REST API — it issues its own tokens. So after sign-in, the CLI exchanges the Entra JWT for a Splunk access token via the Splunk token endpoint (`oauth2/v1/token`, using the JWT as a `client_assertion`), and stores that Splunk token. Subsequent REST calls send the Splunk token as a Bearer token.
 
-When stdout/stdin are not a terminal (piped or CI), the CLI does not wait or open a browser: it prints the URL and code and proceeds to poll, so scripts don't block.
+`auth login` needs to open a browser and bind the loopback port, so it is intended for an interactive desktop session (macOS / Windows). If a browser cannot be opened it prints the URL to open manually, but the loopback redirect must still reach the CLI.
 
-This requires an Entra ID app registration with a public client (device code) enabled, and a matching OAuth 2.0 configuration on the Splunk Cloud side. Put the (non-secret) tenant and client identifiers in the config file:
+This requires an Entra ID app registration with a public client, and a matching OAuth 2.0 configuration on the Splunk Cloud side. On the app registration, add `http://127.0.0.1:49873/callback` as a redirect URI under **Mobile and desktop applications** (Entra matches redirect URIs exactly, which is why the port is fixed). Put the (non-secret) tenant and client identifiers in the config file:
 
 ```toml
 base_url        = "https://prd-p-xxxxxx.splunkcloud.com:8089"
@@ -212,12 +212,9 @@ oauth_client_id = "325df464-153b-4bc5-adac-7e5014b58bb4"
 These three can also come from `SPLUNK_OAUTH_TENANT_ID` / `SPLUNK_OAUTH_CLIENT_ID` / `SPLUNK_OAUTH_SCOPE`. They are not secrets, so unlike the auth fields they may live in the config file or env without special handling.
 
 ```bash
-# Sign in. Shows a code, then opens the browser on Enter. Approve there.
+# Sign in. Opens the browser; approve there. The CLI receives the
+# authorization code on the loopback redirect and stores the Splunk token.
 splunk-cloud-cli auth login
-
-# Same, but also copy the one-time code to the clipboard (macOS only).
-# Only the code is copied — never the access/refresh token.
-splunk-cloud-cli auth login --copy
 
 # Use the CLI as usual — the stored token is picked up automatically.
 splunk-cloud-cli auth whoami
