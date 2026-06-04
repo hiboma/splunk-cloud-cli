@@ -44,7 +44,7 @@ rpassword = "7"
 # code_challenge を作り、認可コードを横取りされても token 交換できないようにする。
 # base64 / rand は既に依存ツリーに居る（transitive）ので直接依存へ格上げするだけ。
 # sha2 のみ新規追加。
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.22"
 rand = "0.9"
 
