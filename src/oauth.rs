@@ -244,7 +244,7 @@ impl PkceParams {
 
 /// 暗号学的乱数 `n` バイトを base64url（no-pad）で文字列化する。
 fn random_token(n: usize) -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut buf = vec![0u8; n];
     // OS の CSPRNG（getrandom）を直に引く。失敗しない実装。
     rand::rng().fill_bytes(&mut buf);

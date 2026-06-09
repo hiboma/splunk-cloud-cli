@@ -46,7 +46,7 @@ rpassword = "7"
 # sha2 のみ新規追加。
 sha2 = "0.11"
 base64 = "0.22"
-rand = "0.9"
+rand = "0.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }
