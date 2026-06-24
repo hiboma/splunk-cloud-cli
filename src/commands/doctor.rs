@@ -42,7 +42,15 @@ const SECRET_ENV: &[&str] = &["SPLUNK_TOKEN", "SPLUNK_SESSION_KEY", "SPLUNK_PASS
 /// チェックが問題を報告したら非ゼロ終了するため `Ok(false)` を返す。
 /// 呼び出し側（main）は戻り値を見て exit code を決める。
 pub async fn run(no_connect: bool, strict: bool) -> Result<bool> {
-    let settings = crate::config::load_settings().unwrap_or_default();
+    // load_settings() のエラーは握り潰さず捕捉する。config.toml が存在しても
+    // TOML パースに失敗すると、実コマンドは `load_settings()?` でエラー終了する。
+    // doctor が黙って Settings::default() に倒れると、本来「ファイルが壊れている」
+    // のに「設定値が未設定」と誤診断してしまうため、パースエラーを CONFIG ブロックで
+    // 明示し、解決済み設定としては空（default）を使う。
+    let (settings, load_error) = match crate::config::load_settings() {
+        Ok(s) => (s, None),
+        Err(e) => (Settings::default(), Some(e.to_string())),
+    };
     let store = default_store();
     let store_ref = store.as_deref();
 
@@ -51,7 +59,7 @@ pub async fn run(no_connect: bool, strict: bool) -> Result<bool> {
     println!("splunk-cloud-cli {}", env!("CARGO_PKG_VERSION"));
     println!();
 
-    print_config_block(&settings);
+    healthy &= print_config_block(load_error.as_deref());
     println!();
 
     healthy &= print_credentials_block(&settings, store_ref);
@@ -72,15 +80,31 @@ pub async fn run(no_connect: bool, strict: bool) -> Result<bool> {
 }
 
 /// CONFIG ブロック。設定ファイルの探索パスと、最初に見つかったファイルを示す。
-fn print_config_block(_settings: &Settings) {
+///
+/// `load_error` は `load_settings()` が返したエラー文字列（主に TOML パース失敗）。
+/// `Some` のとき、見つかったファイルが読めていないことを明示する。`load_settings`
+/// は `config_search_paths` の先頭から最初に存在したファイルを読むため、ここで
+/// 同じく先頭の存在ファイルがパースエラーの対象になる。
+///
+/// 戻り値は「CONFIG が健全か」。パースエラーがあれば false。
+fn print_config_block(load_error: Option<&str>) -> bool {
     println!("CONFIG");
     let paths = config_search_paths();
     let found = paths.iter().find(|p| p.exists());
     match found {
         Some(path) => {
             println!("  path:    {}", path.display());
+            if let Some(err) = load_error {
+                // ファイルは存在するが読めない（壊れている）。実コマンドはここで
+                // エラー終了するので、診断もそれに合わせて問題ありと判定する。
+                println!("  status:  present (UNREADABLE)");
+                println!("  error:   {}", err);
+                print_permission_line(path);
+                return false;
+            }
             println!("  status:  present");
             print_permission_line(path);
+            true
         }
         None => {
             println!("  path:    (none found)");
@@ -89,6 +113,8 @@ fn print_config_block(_settings: &Settings) {
             for p in &paths {
                 println!("    - {}", p.display());
             }
+            // 設定ファイルが無いのは異常ではない（env / Keychain 経由もありうる）。
+            true
         }
     }
 }
@@ -140,9 +166,17 @@ fn print_credentials_block(settings: &Settings, store: Option<&dyn CredentialSto
     }
 
     // 認証方式の判定。resolve_credentials と同じ優先順位を踏襲する:
-    //   env SPLUNK_TOKEN → OAuth session → token(store/toml) → session_key → Basic。
+    //   env SPLUNK_TOKEN → token(store/toml) → OAuth session → session_key → Basic。
+    // resolve_credentials は env+store+toml をまとめた `token` を OAuth より先に
+    // 評価する（config/mod.rs の `if let Some(t) = token` が oauth_auto より前）。
+    // よって手動 token（store/toml）は OAuth session より優先される。
     let token_src = secret_source("SPLUNK_TOKEN", store, KEY_TOKEN, settings.token.is_some());
+    // OAuth セッションの「存在」と「実際に使えるか」を分ける。resolve_credentials は
+    // セッションが store にあっても、tenant/client（resolve_oauth_config）と base_url
+    // が解決できなければ OAuth を採用しない（resolve_oauth_auto が None を返す）。
+    // doctor もこの条件をそろえないと、設定が欠けた OAuth を「使える」と偽診断する。
     let oauth_present = oauth_session_present(store);
+    let oauth_usable = oauth_present && oauth_config_resolvable(settings);
     let session_key_src = secret_source(
         "SPLUNK_SESSION_KEY",
         store,
@@ -174,6 +208,17 @@ fn print_credentials_block(settings: &Settings, store: Option<&dyn CredentialSto
         }
     }
 
+    // OAuth セッションは保存されているが、tenant/client/base_url が欠けて実際には
+    // 使えないケースを告知する。token 優先で OAuth が後回しになる場合（token_src あり）は
+    // 後段の "not used; manual token takes precedence" 行で説明されるため、ここでは
+    // token が無く OAuth がフォールバック候補になりうる場合に限って警告する。
+    if oauth_present && !oauth_usable && token_src.resolved_label().is_none() {
+        println!("  oauth-session: stored but UNUSABLE");
+        println!("                 oauth_tenant_id / oauth_client_id / base_url must resolve");
+        println!("                 for the session to be used. `auth login` will not take effect.");
+        healthy = false;
+    }
+
     let env_token_set = env_set("SPLUNK_TOKEN");
     if let Some(src) = token_src.resolved_label() {
         // env SPLUNK_TOKEN は OAuth より優先される。
@@ -187,7 +232,7 @@ fn print_credentials_block(settings: &Settings, store: Option<&dyn CredentialSto
         } else {
             println!("  auth-method:   bearer-token  (from {})", src);
         }
-    } else if oauth_present {
+    } else if oauth_usable {
         println!("  auth-method:   oauth2  (OAuth session in credential store)");
         print_oauth_config_line(settings);
     } else if let Some(src) = session_key_src.resolved_label() {
@@ -387,6 +432,16 @@ fn oauth_session_present(store: Option<&dyn CredentialStore>) -> bool {
     matches!(store_has(store, KEY_OAUTH_SESSION), StorePresence::Found)
 }
 
+/// OAuth セッションが実際に使える設定がそろっているか。
+///
+/// resolve_oauth_auto（config/mod.rs）が OAuth を採用する条件のうち、設定由来の
+/// 2 条件（tenant/client が resolve_oauth_config で解決でき、base_url が解決できる）を
+/// 確認する。セッション JSON のパース可否までは見ないが、設定欠落による偽陽性
+/// （セッションは在るが tenant/client 未設定で実際は使えない）を防ぐのが目的。
+fn oauth_config_resolvable(settings: &Settings) -> bool {
+    crate::config::resolve_oauth_config(settings).is_ok() && resolve_base_url(settings).is_ok()
+}
+
 enum StorePresence {
     Found,
     NotFound,
@@ -427,6 +482,9 @@ mod tests {
             "SPLUNK_SESSION_KEY",
             "SPLUNK_PASSWORD",
             "SPLUNK_BASE_URL",
+            "SPLUNK_OAUTH_TENANT_ID",
+            "SPLUNK_OAUTH_CLIENT_ID",
+            "SPLUNK_OAUTH_SCOPE",
         ] {
             unsafe {
                 std::env::remove_var(k);
@@ -542,5 +600,56 @@ mod tests {
             Some("y")
         );
         assert!(first_non_empty(&[None, Some("".into())]).is_none());
+    }
+
+    // --- finding #1: config パースエラーを CONFIG ブロックで問題ありと判定する ---
+
+    #[test]
+    fn config_block_healthy_when_no_load_error() {
+        // load_error が None なら CONFIG は健全（存在/不在を問わず true）。
+        assert!(print_config_block(None));
+    }
+
+    #[test]
+    fn config_block_unhealthy_on_parse_error() {
+        // load_settings() がパースエラーを返した場合、CONFIG は false を返す。
+        // 実コマンドが load_settings()? でエラー終了するのと整合させ、doctor が
+        // 「ファイルが壊れている」のに「設定値が未設定」と誤診断しないことを保証する。
+        assert!(!print_config_block(Some(
+            "failed to parse config.toml: ..."
+        )));
+    }
+
+    // --- finding #2: OAuth セッションが在っても設定が欠ければ usable でない ---
+
+    #[test]
+    fn oauth_config_resolvable_requires_tenant_client_and_base_url() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_env();
+
+        // tenant/client/base_url がすべてそろえば usable。
+        let full = Settings {
+            base_url: Some("https://x.splunkcloud.com:8089".into()),
+            oauth_tenant_id: Some("tenant".into()),
+            oauth_client_id: Some("client".into()),
+            ..Settings::default()
+        };
+        assert!(oauth_config_resolvable(&full));
+
+        // tenant/client があっても base_url が無ければ usable でない。
+        let no_base = Settings {
+            oauth_tenant_id: Some("tenant".into()),
+            oauth_client_id: Some("client".into()),
+            ..Settings::default()
+        };
+        assert!(!oauth_config_resolvable(&no_base));
+
+        // base_url があっても tenant/client が無ければ usable でない。
+        // これがセッションだけ在って tenant/client 未設定の偽陽性ケースに対応する。
+        let no_oauth_cfg = Settings {
+            base_url: Some("https://x.splunkcloud.com:8089".into()),
+            ..Settings::default()
+        };
+        assert!(!oauth_config_resolvable(&no_oauth_cfg));
     }
 }
