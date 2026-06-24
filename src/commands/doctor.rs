@@ -100,11 +100,11 @@ fn print_config_block(load_error: Option<&str>) -> bool {
                 println!("  status:  present (UNREADABLE)");
                 println!("  error:   {}", err);
                 print_permission_line(path);
-                return false;
+                return config_healthy(true, load_error);
             }
             println!("  status:  present");
             print_permission_line(path);
-            true
+            config_healthy(true, load_error)
         }
         None => {
             println!("  path:    (none found)");
@@ -114,9 +114,16 @@ fn print_config_block(load_error: Option<&str>) -> bool {
                 println!("    - {}", p.display());
             }
             // 設定ファイルが無いのは異常ではない（env / Keychain 経由もありうる）。
-            true
+            config_healthy(false, load_error)
         }
     }
+}
+
+/// CONFIG が健全か。設定ファイルが存在し（`found`）かつ load_error があるときだけ
+/// false（パース失敗）。ファイルが無ければ load_error は起こり得ず、env / Keychain
+/// 経由もあるため健全扱い。print_config_block の I/O と判定を分けてテスト可能にする。
+fn config_healthy(found: bool, load_error: Option<&str>) -> bool {
+    !(found && load_error.is_some())
 }
 
 /// 設定ファイルの permission を表示し、group/others から読める場合は警告を添える。
@@ -605,19 +612,24 @@ mod tests {
     // --- finding #1: config パースエラーを CONFIG ブロックで問題ありと判定する ---
 
     #[test]
-    fn config_block_healthy_when_no_load_error() {
-        // load_error が None なら CONFIG は健全（存在/不在を問わず true）。
-        assert!(print_config_block(None));
-    }
+    fn config_healthy_only_unhealthy_when_found_and_parse_error() {
+        // ファイルが見つかり、かつ load_error があるときだけ unhealthy。これが
+        // 「config.toml は present だが壊れている」ケースで、実コマンドが
+        // load_settings()? でエラー終了するのと整合する。doctor が「設定値が未設定」と
+        // 誤診断しないことを保証する。print_config_block は config_search_paths() の
+        // 実ファイル存在に依存しテスト環境ごとにぶれるため、判定だけを分離して検証する。
+        assert!(!config_healthy(
+            true,
+            Some("failed to parse config.toml: ...")
+        ));
 
-    #[test]
-    fn config_block_unhealthy_on_parse_error() {
-        // load_settings() がパースエラーを返した場合、CONFIG は false を返す。
-        // 実コマンドが load_settings()? でエラー終了するのと整合させ、doctor が
-        // 「ファイルが壊れている」のに「設定値が未設定」と誤診断しないことを保証する。
-        assert!(!print_config_block(Some(
-            "failed to parse config.toml: ..."
-        )));
+        // load_error が無ければ、ファイルの有無に関わらず健全。
+        assert!(config_healthy(true, None));
+        assert!(config_healthy(false, None));
+
+        // ファイルが無ければ load_error は起こり得ないが、防御的に健全扱い。
+        // （env / Keychain 経由の設定もありうるため設定ファイル不在は異常ではない。）
+        assert!(config_healthy(false, Some("ignored")));
     }
 
     // --- finding #2: OAuth セッションが在っても設定が欠ければ usable でない ---
