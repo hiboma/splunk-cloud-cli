@@ -160,8 +160,22 @@ fn print_credentials_block(settings: &Settings, store: Option<&dyn CredentialSto
         .filter(|s| !s.is_empty())
         .or_else(|| settings.username.clone());
 
+    // store backend 障害があれば先に警告する。resolve_credentials は障害時に
+    // toml フォールバックを拒否して認証情報を解決しない。auth-method 判定では
+    // StoreUnreachable を「出所なし」として扱い（resolved_label が None）、
+    // 偽の「認証できる」表示を避ける。ここで障害そのものを 1 行で告知する。
+    for s in [&token_src, &session_key_src, &password_src] {
+        if let SecretSource::StoreUnreachable(msg) = s {
+            println!("  credential-store: UNREACHABLE ({})", msg);
+            println!("                    Stored secrets cannot be read; config.toml is NOT");
+            println!("                    used as a fallback. Fix store access and retry.");
+            healthy = false;
+            break;
+        }
+    }
+
     let env_token_set = env_set("SPLUNK_TOKEN");
-    if let Some(src) = &token_src {
+    if let Some(src) = token_src.resolved_label() {
         // env SPLUNK_TOKEN は OAuth より優先される。
         if env_token_set {
             println!("  auth-method:   bearer-token  (from {})", src);
@@ -176,9 +190,9 @@ fn print_credentials_block(settings: &Settings, store: Option<&dyn CredentialSto
     } else if oauth_present {
         println!("  auth-method:   oauth2  (OAuth session in credential store)");
         print_oauth_config_line(settings);
-    } else if let Some(src) = &session_key_src {
+    } else if let Some(src) = session_key_src.resolved_label() {
         println!("  auth-method:   session-key  (from {})", src);
-    } else if let (Some(u), Some(src)) = (&username, &password_src) {
+    } else if let (Some(u), Some(src)) = (&username, password_src.resolved_label()) {
         println!(
             "  auth-method:   basic  (user={}, password from {})",
             u, src
@@ -314,33 +328,55 @@ fn env_set(key: &str) -> bool {
     std::env::var(key).map(|v| !v.is_empty()).unwrap_or(false)
 }
 
-/// 秘密フィールドの出所を、resolve_secret と同じ優先順位（env → store → toml）で
-/// 判定して人間向け文字列にする。秘密値そのものは読まない／返さない。
+/// 秘密フィールドの解決結果。`resolve_secret` の挙動と 1:1 で対応させる。
 ///
-/// store backend エラーは「store unreachable」と明示する。env で上書きされて
-/// いれば store/toml は見ない（resolve_secret の挙動に合わせる）。
+/// 重要なのは `StoreUnreachable` を「採用可能な出所」と混同しないこと。
+/// `resolve_secret` は store backend エラー時に `None`（= 解決不能）を返し、
+/// toml フォールバックも拒否する。doctor もこれに合わせ、`StoreUnreachable` は
+/// auth-method を構成しない（実コマンドが `no credential set` で失敗する状態を
+/// 「認証できる」と偽らないため）。
+enum SecretSource {
+    /// 採用可能な出所が見つかった（env / credential store / config.toml）。
+    Resolved(String),
+    /// store backend 障害で解決不能。toml に書いてあっても採用されない。
+    StoreUnreachable(String),
+    /// どこにも無い。
+    Absent,
+}
+
+impl SecretSource {
+    /// 採用可能な出所の表示文字列。auth-method を構成できる場合のみ `Some`。
+    fn resolved_label(&self) -> Option<&str> {
+        match self {
+            SecretSource::Resolved(s) => Some(s),
+            SecretSource::StoreUnreachable(_) | SecretSource::Absent => None,
+        }
+    }
+}
+
+/// 秘密フィールドの出所を、resolve_secret と同じ優先順位（env → store → toml）で
+/// 判定する。秘密値そのものは読まない／返さない。
+///
+/// env で上書きされていれば store/toml は見ない（resolve_secret の挙動に合わせる）。
+/// store backend エラーは `StoreUnreachable` として返し、resolve_secret が
+/// toml フォールバックを拒否する挙動と一致させる。
 fn secret_source(
     env_key: &str,
     store: Option<&dyn CredentialStore>,
     store_key: &str,
     in_toml: bool,
-) -> Option<String> {
+) -> SecretSource {
     if env_set(env_key) {
-        return Some(format!("env {}", env_key));
+        return SecretSource::Resolved(format!("env {}", env_key));
     }
     match store_has(store, store_key) {
-        StorePresence::Found => Some("credential store".to_string()),
-        StorePresence::BackendError(msg) => {
-            // store が壊れている場合、resolve_secret は toml フォールバックを拒否する。
-            // 診断としては「store 到達不可」を明示しつつ、toml に書いてあっても
-            // 採用されない旨を示すため Some を返す（値は出さない）。
-            Some(format!("credential store UNREACHABLE: {}", msg))
-        }
+        StorePresence::Found => SecretSource::Resolved("credential store".to_string()),
+        StorePresence::BackendError(msg) => SecretSource::StoreUnreachable(msg),
         StorePresence::NotFound => {
             if in_toml {
-                Some("config.toml".to_string())
+                SecretSource::Resolved("config.toml".to_string())
             } else {
-                None
+                SecretSource::Absent
             }
         }
     }
@@ -408,7 +444,7 @@ mod tests {
         let store = MemoryStore::new();
         store.set(KEY_TOKEN, "from-store").unwrap();
         let src = secret_source("SPLUNK_TOKEN", Some(&store), KEY_TOKEN, true);
-        assert_eq!(src.as_deref(), Some("env SPLUNK_TOKEN"));
+        assert_eq!(src.resolved_label(), Some("env SPLUNK_TOKEN"));
         unsafe {
             std::env::remove_var("SPLUNK_TOKEN");
         }
@@ -421,7 +457,7 @@ mod tests {
         let store = MemoryStore::new();
         store.set(KEY_TOKEN, "from-store").unwrap();
         let src = secret_source("SPLUNK_TOKEN", Some(&store), KEY_TOKEN, true);
-        assert_eq!(src.as_deref(), Some("credential store"));
+        assert_eq!(src.resolved_label(), Some("credential store"));
     }
 
     #[test]
@@ -430,7 +466,7 @@ mod tests {
         clear_env();
         let store = MemoryStore::new();
         let src = secret_source("SPLUNK_TOKEN", Some(&store), KEY_TOKEN, true);
-        assert_eq!(src.as_deref(), Some("config.toml"));
+        assert_eq!(src.resolved_label(), Some("config.toml"));
     }
 
     #[test]
@@ -439,19 +475,27 @@ mod tests {
         clear_env();
         let store = MemoryStore::new();
         let src = secret_source("SPLUNK_TOKEN", Some(&store), KEY_TOKEN, false);
-        assert!(src.is_none());
+        assert!(matches!(src, SecretSource::Absent));
+        assert!(src.resolved_label().is_none());
     }
 
     #[test]
-    fn secret_source_backend_error_is_unreachable() {
+    fn secret_source_backend_error_is_unreachable_and_not_resolvable() {
         let _lock = ENV_LOCK.lock().unwrap();
         clear_env();
         let store = FailingStore;
-        // toml に書いてあっても store backend エラー時は UNREACHABLE を明示する。
+        // store backend エラー時は StoreUnreachable を返す。toml に書いてあっても
+        // 採用しない（resolved_label が None）。これが resolve_secret の
+        // BackendError → None と一致する核心。auth-method を偽って構成しない。
         let src = secret_source("SPLUNK_TOKEN", Some(&store), KEY_TOKEN, true);
-        let s = src.expect("should report unreachable");
-        assert!(s.contains("UNREACHABLE"), "got: {}", s);
-        assert!(!s.contains("config.toml"), "should not claim toml: {}", s);
+        assert!(
+            matches!(src, SecretSource::StoreUnreachable(_)),
+            "expected StoreUnreachable"
+        );
+        assert!(
+            src.resolved_label().is_none(),
+            "store-unreachable must not be a usable source"
+        );
     }
 
     #[test]
@@ -462,7 +506,7 @@ mod tests {
         // Unavailable（非 macOS / default keychain 無し）は store 非搭載扱い。
         // toml フォールバックを許す（resolve_secret と一致）。
         let src = secret_source("SPLUNK_TOKEN", Some(&store), KEY_TOKEN, true);
-        assert_eq!(src.as_deref(), Some("config.toml"));
+        assert_eq!(src.resolved_label(), Some("config.toml"));
     }
 
     #[test]
@@ -474,9 +518,10 @@ mod tests {
         }
         let store = MemoryStore::new();
         store.set(KEY_TOKEN, "STORE_SECRET").unwrap();
-        let src = secret_source("SPLUNK_TOKEN", Some(&store), KEY_TOKEN, true).unwrap();
-        assert!(!src.contains("SUPER_SECRET_VALUE"));
-        assert!(!src.contains("STORE_SECRET"));
+        let src = secret_source("SPLUNK_TOKEN", Some(&store), KEY_TOKEN, true);
+        let label = src.resolved_label().unwrap();
+        assert!(!label.contains("SUPER_SECRET_VALUE"));
+        assert!(!label.contains("STORE_SECRET"));
         unsafe {
             std::env::remove_var("SPLUNK_TOKEN");
         }
