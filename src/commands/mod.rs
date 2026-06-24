@@ -2,6 +2,7 @@ pub mod alert;
 pub mod auth;
 pub mod credentials;
 pub mod dashboard;
+pub mod doctor;
 pub mod federated;
 pub mod index;
 pub mod knowledge;

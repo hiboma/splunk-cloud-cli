@@ -383,6 +383,43 @@ splunk-cloud-cli alert actions-ls
 splunk-cloud-cli alert fired-ls
 ```
 
+### Diagnostics (`doctor`)
+
+`doctor` diagnoses configuration, credentials, environment, and connectivity in
+one shot — useful when a command fails and you need to see how settings are
+resolved without revealing any secret value.
+
+```bash
+# Full diagnosis, including a single HEAD probe against base_url.
+splunk-cloud-cli doctor
+
+# Offline only (skip the network probe).
+splunk-cloud-cli doctor --no-connect
+
+# Exit non-zero when any check reports a problem (handy in CI).
+splunk-cloud-cli doctor --strict
+```
+
+It prints four blocks:
+
+- `CONFIG` — which config file was found (and its permission bits) or the paths searched.
+  A file that exists but fails to parse is reported as `present (UNREADABLE)` with the
+  parse error, matching the failure a real command would hit.
+- `ACTIVE CREDENTIALS` — the resolved `base_url`, the chosen auth method, and **where**
+  each secret comes from (`env`, `credential store`, or `config.toml`). Secret values are
+  never printed; only their source and presence. A stored OAuth session that cannot be
+  used because `oauth_tenant_id` / `oauth_client_id` / `base_url` are missing is flagged
+  as `stored but UNUSABLE` rather than reported as a working `oauth2` method.
+- `ENVIRONMENT` — the `SPLUNK_*` variables. Non-secret values are shown; secret ones
+  (`SPLUNK_TOKEN` / `SPLUNK_SESSION_KEY` / `SPLUNK_PASSWORD`) report only `(set)` / `(unset)`.
+- `CONNECTIVITY` — a single unauthenticated `HEAD` against `base_url` with the HTTP status
+  and round-trip time. A `401` means the host is reachable but the credential is the issue,
+  not the connection.
+
+`doctor` exits 0 even when checks fail, so it is safe to run anywhere. Pass `--strict`
+to make a missing `base_url`, an unresolvable auth method, or a failed connection
+exit non-zero.
+
 ### Output formats
 
 `-f pretty|json|yaml|csv` (default `pretty`). CSV extracts `results[]` or `entry[]` from the response.
