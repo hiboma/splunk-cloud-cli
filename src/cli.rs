@@ -119,6 +119,22 @@ pub enum Command {
     #[command(subcommand)]
     Credentials(CredentialsCmd),
 
+    /// Diagnose configuration, credentials, environment, and connectivity.
+    ///
+    /// Prints where each setting is resolved from (config file, environment
+    /// variable, or OS credential store) without ever revealing secret values,
+    /// then performs a single connectivity probe against `base_url`.
+    /// Always exits 0 unless `--strict` is given.
+    Doctor {
+        /// Skip the network connectivity probe (offline diagnosis only).
+        #[arg(long)]
+        no_connect: bool,
+        /// Exit non-zero when any check reports a problem.
+        /// Useful in CI to fail fast on a misconfigured environment.
+        #[arg(long)]
+        strict: bool,
+    },
+
     /// Generate shell completion script.
     Completion {
         #[arg(value_enum)]

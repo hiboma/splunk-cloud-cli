@@ -53,6 +53,16 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Credentials(c) => {
             return commands::credentials::run(c);
         }
+        Command::Doctor { no_connect, strict } => {
+            // doctor は接続情報の解決を自前で診断するため、共通の
+            // resolve_credentials / client 構築を経由しない。`--strict` で
+            // 問題が見つかった場合は非ゼロ終了させる。
+            let healthy = commands::doctor::run(*no_connect, *strict).await?;
+            if !healthy {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -84,8 +94,8 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Index(c) => commands::index::run(c, &client, format).await,
         Command::Metrics(c) => commands::metrics::run(c, &client, format).await,
         Command::Alert(c) => commands::alert::run(c, &client, format).await,
-        Command::Completion { .. } | Command::Credentials(_) => Err(SplunkError::Config(
-            "unreachable: handled above".to_string(),
-        )),
+        Command::Completion { .. } | Command::Credentials(_) | Command::Doctor { .. } => Err(
+            SplunkError::Config("unreachable: handled above".to_string()),
+        ),
     }
 }
