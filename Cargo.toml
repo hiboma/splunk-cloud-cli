@@ -45,7 +45,7 @@ rpassword = "7"
 # base64 / rand は既に依存ツリーに居る（transitive）ので直接依存へ格上げするだけ。
 # sha2 のみ新規追加。
 sha2 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 rand = "0.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
