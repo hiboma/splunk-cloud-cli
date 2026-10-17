@@ -2,6 +2,7 @@ use crate::config::credential_store::{default_store, CredentialStore, KEY_OAUTH_
 use crate::config::{AuthMethod, Credentials, OAuthAuto};
 use crate::error::{Result, SplunkError};
 use crate::oauth::{self, OAuthSession};
+use crate::transport::{Endpoint, HttpClient};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -20,7 +21,8 @@ pub struct Authorizer {
     base_url: String,
     method: AuthMethod,
     cached_session: Arc<RwLock<Option<String>>>,
-    http: reqwest::Client,
+    http: HttpClient,
+    oauth_context: Option<OAuthAuto>,
     /// OAuth (`auth login`) セッションの自動更新状態。OAuth セッション由来の
     /// `BearerToken` のときだけ `Some`。Splunk token 失効時に再交換／refresh する。
     oauth: Option<Arc<RwLock<OAuthState>>>,
@@ -55,7 +57,7 @@ impl std::fmt::Debug for Authorizer {
 }
 
 impl Authorizer {
-    pub fn new(creds: &Credentials, http: reqwest::Client) -> Self {
+    pub fn new(creds: &Credentials, http: HttpClient) -> Self {
         Self::new_with_store(creds, http, default_store().map(Arc::from))
     }
 
@@ -63,7 +65,7 @@ impl Authorizer {
     /// `store` が `None` の場合、OAuth 自動更新は無効（refresh の書き戻し先が無いため）。
     pub fn new_with_store(
         creds: &Credentials,
-        http: reqwest::Client,
+        http: HttpClient,
         store: Option<Arc<dyn CredentialStore>>,
     ) -> Self {
         let oauth = build_oauth_state(creds, store).map(|s| Arc::new(RwLock::new(s)));
@@ -72,12 +74,14 @@ impl Authorizer {
             method: creds.auth.clone(),
             cached_session: Arc::new(RwLock::new(None)),
             http,
+            oauth_context: creds.oauth.clone(),
             oauth,
         }
     }
 
     /// 現在の認証方式に対応する Authorization ヘッダを構築する。
     pub async fn auth_header(&self) -> Result<HeaderMap> {
+        Endpoint::parse(&self.base_url)?;
         let value = match &self.method {
             AuthMethod::BearerToken(t) => {
                 // OAuth 自動更新が有効なら、失効間近のとき refresh してから組む。
@@ -102,6 +106,14 @@ impl Authorizer {
     /// 失効間近なら、Entra access での再交換（必要なら Entra refresh）を行い、
     /// store に書き戻してから返す。OAuth 無効（手動 Bearer）の場合は固定値を返す。
     async fn bearer_token(&self, fixed: &str) -> Result<String> {
+        if let Some(context) = &self.oauth_context {
+            context.session.validate(&context.config, &self.base_url)?;
+            if Endpoint::parse(&context.base_url)? != Endpoint::parse(&self.base_url)? {
+                return Err(SplunkError::Auth(
+                    "OAuth endpoint changed; run auth login again".into(),
+                ));
+            }
+        }
         let Some(state_lock) = &self.oauth else {
             return Ok(fixed.to_string());
         };
@@ -152,6 +164,7 @@ impl Authorizer {
 
     /// キャッシュ済みの session key が無ければ `/services/auth/login` を叩く。
     async fn login_if_needed(&self, username: &str, password: &str) -> Result<String> {
+        let endpoint = Endpoint::parse(&self.base_url)?;
         {
             let guard = self.cached_session.read().await;
             if let Some(ref sk) = *guard {
@@ -163,7 +176,7 @@ impl Authorizer {
             return Ok(sk.clone());
         }
 
-        let url = format!("{}/services/auth/login?output_mode=json", self.base_url);
+        let url = format!("{}/services/auth/login?output_mode=json", endpoint.as_str());
         let resp = self
             .http
             .post(&url)
@@ -172,11 +185,15 @@ impl Authorizer {
             .await?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            let body = crate::util::truncate_chars(&body, 200);
-            return Err(SplunkError::Auth(format!("{}: {}", status, body)));
+            return Err(SplunkError::Auth(format!(
+                "login returned HTTP {}",
+                status.as_u16()
+            )));
         }
-        let parsed: LoginResponse = resp.json().await?;
+        let parsed: LoginResponse = resp
+            .json()
+            .await
+            .map_err(|_| SplunkError::Auth("login returned an invalid response".into()))?;
         *guard = Some(parsed.session_key.clone());
         Ok(parsed.session_key)
     }
@@ -269,6 +286,13 @@ mod tests {
 
     fn make_session(splunk_exp: u64) -> OAuthSession {
         OAuthSession {
+            binding: Some(
+                crate::oauth::SessionBinding::new(
+                    &oauth_config(),
+                    "https://example.splunkcloud.com:8089",
+                )
+                .unwrap(),
+            ),
             splunk_token: "SPLUNK".into(),
             splunk_expires_at: splunk_exp,
             entra_access_token: "ENTRA".into(),
@@ -323,7 +347,7 @@ mod tests {
     async fn bearer_token_returns_current_when_valid() {
         let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
         let creds = oauth_creds(oauth::now_unix() + 3600, true);
-        let auth = Authorizer::new_with_store(&creds, reqwest::Client::new(), Some(store));
+        let auth = Authorizer::new_with_store(&creds, HttpClient::new().unwrap(), Some(store));
         // Splunk token が失効していないので更新せず現在値を返す
         let tok = auth.bearer_token("SPLUNK").await.unwrap();
         assert_eq!(tok, "SPLUNK");
@@ -334,9 +358,79 @@ mod tests {
         // OAuth 無効（手動 Bearer）の場合は固定値をそのまま使う
         let creds = oauth_creds(0, false);
         let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
-        let auth = Authorizer::new_with_store(&creds, reqwest::Client::new(), Some(store));
+        let auth = Authorizer::new_with_store(&creds, HttpClient::new().unwrap(), Some(store));
         let tok = auth.bearer_token("FIXED").await.unwrap();
         assert_eq!(tok, "FIXED");
+    }
+
+    #[tokio::test]
+    async fn cached_oauth_token_requires_matching_destination_even_without_store() {
+        for has_store in [false, true] {
+            let mut creds = oauth_creds(oauth::now_unix() + 3600, true);
+            creds.base_url = "https://other.example.com".into();
+            let store = has_store.then(|| Arc::new(MemoryStore::new()) as Arc<dyn CredentialStore>);
+            let auth = Authorizer::new_with_store(&creds, HttpClient::new().unwrap(), store);
+            assert!(auth.auth_header().await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_destination_cannot_differ_from_request_destination() {
+        let mut creds = oauth_creds(oauth::now_unix() + 3600, true);
+        creds.oauth.as_mut().unwrap().base_url = "https://other.example.com".into();
+        let auth = Authorizer::new_with_store(&creds, HttpClient::new().unwrap(), None);
+        assert!(auth.auth_header().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_session_cannot_authorize_without_a_store() {
+        let mut creds = oauth_creds(oauth::now_unix() + 3600, true);
+        creds.oauth.as_mut().unwrap().session.binding = None;
+        let auth = Authorizer::new_with_store(&creds, HttpClient::new().unwrap(), None);
+        assert!(auth.auth_header().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn invalidation_reexchanges_only_at_bound_origin_and_persists_binding() {
+        let mut server = mockito::Server::new_async().await;
+        let exchange = server
+            .mock("POST", "/oauth2/v1/token")
+            .match_body(mockito::Matcher::UrlEncoded(
+                "client_assertion".into(),
+                "ENTRA".into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"access_token":"NEW_SPLUNK","expires_in":3600}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let mut creds = oauth_creds(oauth::now_unix() + 3600, true);
+        creds.base_url = server.url();
+        let context = creds.oauth.as_mut().unwrap();
+        context.base_url = server.url();
+        context.session.binding =
+            Some(crate::oauth::SessionBinding::new(&context.config, &server.url()).unwrap());
+        let binding = context.session.binding.clone();
+        let store = Arc::new(MemoryStore::new());
+        let auth =
+            Authorizer::new_with_store(&creds, HttpClient::new().unwrap(), Some(store.clone()));
+        assert_eq!(
+            auth.auth_header().await.unwrap()[AUTHORIZATION],
+            "Bearer SPLUNK"
+        );
+        auth.invalidate().await;
+        assert_eq!(
+            auth.auth_header().await.unwrap()[AUTHORIZATION],
+            "Bearer NEW_SPLUNK"
+        );
+        assert_eq!(
+            auth.auth_header().await.unwrap()[AUTHORIZATION],
+            "Bearer NEW_SPLUNK"
+        );
+        let saved =
+            OAuthSession::from_json(&store.get(KEY_OAUTH_SESSION).unwrap().unwrap()).unwrap();
+        assert_eq!(saved.binding, binding);
+        exchange.assert_async().await;
     }
 
     #[test]

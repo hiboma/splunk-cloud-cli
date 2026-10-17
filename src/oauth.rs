@@ -153,49 +153,39 @@ fn expires_at_from(expires_in: u64, now: u64) -> u64 {
     now.saturating_add(expires_in)
 }
 
-/// サーバ由来のエラーテキスト（認可サーバの `error_description`、Splunk の
-/// エラー本文など）を、端末・ログへ出す前に安全化する。
-///
-/// 1. JWT らしきトークン（`eyJ...` で始まる 3 セグメントの base64url 文字列）を
-///    `***` に伏せる。Splunk 交換のエラー本文は `client_assertion`（Entra JWT、
-///    秘密値）をエコーし得るため、断片混入を防ぐ。
-/// 2. 制御文字（ANSI エスケープ等）を除去する。外部入力をそのまま端末へ出すと
-///    エスケープシーケンス注入の余地があるため。
-/// 3. 最後に文字数で切り詰める。
-fn sanitize_server_text(s: &str, max: usize) -> String {
-    let masked = mask_jwt_like(s);
-    let cleaned: String = masked
-        .chars()
-        // 制御文字は落とす（改行・タブも端末出力では不要なので除く）。
-        .filter(|c| !c.is_control())
-        .collect();
-    crate::util::truncate_chars(&cleaned, max)
+// Only static strings may cross the authentication error boundary. Even the
+// protocol's `error` field is untrusted and may contain a reflected secret.
+fn safe_error_code(code: &str) -> &'static str {
+    match code {
+        "invalid_request" => "invalid_request",
+        "invalid_client" => "invalid_client",
+        "invalid_grant" => "invalid_grant",
+        "unauthorized_client" => "unauthorized_client",
+        "unsupported_grant_type" => "unsupported_grant_type",
+        "invalid_scope" => "invalid_scope",
+        "access_denied" => "access_denied",
+        "server_error" => "server_error",
+        "temporarily_unavailable" => "temporarily_unavailable",
+        _ => "authentication_error",
+    }
 }
 
-/// `eyJ` で始まる JWT 様トークン（`header.payload.signature` の 3 セグメント、
-/// 各セグメントは base64url 文字）を `***` に置き換える。
-///
-/// 空白で語に分け、各語の前後にある引用符・記号（`"` や `,` 等）は保ったまま、
-/// 中央の JWT 部分だけを伏せる。JWT のセグメント区切りは `.` なので、`.` は
-/// b64url 文字に含めて 1 語として扱い、`eyJ` 始まり・ドット 2 個で判定する。
-fn mask_jwt_like(s: &str) -> String {
-    // JWT 本体を構成しうる文字（base64url + セグメント区切りの `.`）。
-    fn is_jwt_char(c: char) -> bool {
-        c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
-    }
-    let masked: Vec<String> = s
-        .split_whitespace()
-        .map(|word| {
-            let core = word.trim_matches(|c: char| !is_jwt_char(c));
-            if core.starts_with("eyJ") && core.matches('.').count() == 2 {
-                // 前後の記号（引用符等）は残し、芯だけ伏せる。
-                word.replacen(core, "***", 1)
-            } else {
-                word.to_string()
-            }
+fn token_error(stage: &str, status: reqwest::StatusCode, body: &[u8]) -> SplunkError {
+    let code = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(safe_error_code)
         })
-        .collect();
-    masked.join(" ")
+        .unwrap_or("authentication_error");
+    SplunkError::Auth(format!(
+        "{} failed (http {}): {}",
+        stage,
+        status.as_u16(),
+        code
+    ))
 }
 
 // --- PKCE ---
@@ -268,14 +258,6 @@ struct TokenResponse {
     expires_in: u64,
 }
 
-/// `POST /token` のエラーレスポンス。
-#[derive(Deserialize)]
-struct TokenErrorResponse {
-    error: String,
-    #[serde(default)]
-    error_description: Option<String>,
-}
-
 /// ブラウザで開く案内。`auth login` が標準エラー出力へ表示する。
 pub struct UserPrompt {
     /// ブラウザで開く authorize URL（PKCE / state 込み）。
@@ -298,7 +280,7 @@ pub type PromptFn<'a> = dyn Fn(&UserPrompt) + Send + Sync + 'a;
 /// `AUTH_WAIT_SECS` を過ぎても redirect が来なければタイムアウトする。
 pub async fn authorization_code_login(
     cfg: &OAuthConfig,
-    http: &reqwest::Client,
+    http: &crate::transport::HttpClient,
     on_prompt: &PromptFn<'_>,
 ) -> Result<TokenSet> {
     let pkce = PkceParams::generate();
@@ -340,7 +322,7 @@ async fn run_authorization_code_flow(
     redirect_uri: &str,
     pkce: &PkceParams,
     wait: Duration,
-    http: &reqwest::Client,
+    http: &crate::transport::HttpClient,
     on_prompt: &PromptFn<'_>,
 ) -> Result<TokenSet> {
     let authorize_url = build_authorize_url(cfg, redirect_uri, pkce);
@@ -363,13 +345,12 @@ async fn run_authorization_code_flow(
     }
 
     // 認可サーバがエラーを返した場合（ユーザーが拒否した等）。
-    // error / error_description は redirect クエリ由来の外部入力。端末へ出す前に
-    // 制御文字（ANSI エスケープ等）を除き、長さを絞ってから埋める。
+    // redirect クエリは外部入力なので、既知の固定エラーコードだけを表示する。
+    // error_description は秘密値を反射し得るため使用しない。
     if let Some(err) = callback.error {
         return Err(SplunkError::Auth(format!(
-            "authorization failed ({}): {}",
-            sanitize_server_text(&err, 80),
-            sanitize_server_text(&callback.error_description.unwrap_or_default(), 200)
+            "authorization failed: {}",
+            safe_error_code(&err)
         )));
     }
 
@@ -415,7 +396,7 @@ fn build_authorize_url(cfg: &OAuthConfig, redirect_uri: &str, pkce: &PkceParams)
 async fn exchange_authorization_code_to(
     token_endpoint: &str,
     cfg: &OAuthConfig,
-    http: &reqwest::Client,
+    http: &crate::transport::HttpClient,
     code: &str,
     redirect_uri: &str,
     code_verifier: &str,
@@ -436,23 +417,15 @@ async fn exchange_authorization_code_to(
     let status = resp.status();
     let body = resp.bytes().await?;
     if status.is_success() {
-        let tr: TokenResponse = serde_json::from_slice(&body)?;
+        let tr: TokenResponse = serde_json::from_slice(&body)
+            .map_err(|_| SplunkError::Auth("Invalid token response".into()))?;
         Ok(TokenSet {
             access_token: tr.access_token,
             refresh_token: tr.refresh_token,
             expires_at: expires_at_from(tr.expires_in, now_unix()),
         })
     } else {
-        let err: TokenErrorResponse = serde_json::from_slice(&body).unwrap_or(TokenErrorResponse {
-            error: format!("http {}", status.as_u16()),
-            error_description: None,
-        });
-        Err(SplunkError::Auth(format!(
-            "authorization code exchange failed ({}): {}",
-            err.error,
-            err.error_description
-                .unwrap_or_else(|| "no description".to_string())
-        )))
+        Err(token_error("authorization code exchange", status, &body))
     }
 }
 
@@ -461,7 +434,6 @@ struct CallbackParams {
     code: Option<String>,
     state: String,
     error: Option<String>,
-    error_description: Option<String>,
 }
 
 /// loopback サーバで認可レスポンスを受け取り、`code` / `state` を取り出す。
@@ -567,7 +539,6 @@ fn parse_callback_query(target: &str) -> Option<CallbackParams> {
     let mut code = None;
     let mut state = None;
     let mut error = None;
-    let mut error_description = None;
     for pair in query.split('&') {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         let val = urlencoding::decode(v).map(|c| c.into_owned()).ok()?;
@@ -575,7 +546,6 @@ fn parse_callback_query(target: &str) -> Option<CallbackParams> {
             "code" => code = Some(val),
             "state" => state = Some(val),
             "error" => error = Some(val),
-            "error_description" => error_description = Some(val),
             _ => {}
         }
     }
@@ -584,7 +554,6 @@ fn parse_callback_query(target: &str) -> Option<CallbackParams> {
         // state が無い応答は検証で弾く。空文字を入れておく。
         state: state.unwrap_or_default(),
         error,
-        error_description,
     })
 }
 
@@ -640,7 +609,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// refresh token で新しい access token を得る。
 pub async fn refresh(
     cfg: &OAuthConfig,
-    http: &reqwest::Client,
+    http: &crate::transport::HttpClient,
     refresh_token: &str,
 ) -> Result<TokenSet> {
     refresh_to(&cfg.token_url(), cfg, http, refresh_token).await
@@ -651,7 +620,7 @@ pub async fn refresh(
 async fn refresh_to(
     token_endpoint: &str,
     cfg: &OAuthConfig,
-    http: &reqwest::Client,
+    http: &crate::transport::HttpClient,
     refresh_token: &str,
 ) -> Result<TokenSet> {
     let resp = http
@@ -668,7 +637,8 @@ async fn refresh_to(
     let status = resp.status();
     let body = resp.bytes().await?;
     if status.is_success() {
-        let tr: TokenResponse = serde_json::from_slice(&body)?;
+        let tr: TokenResponse = serde_json::from_slice(&body)
+            .map_err(|_| SplunkError::Auth("Invalid token response".into()))?;
         Ok(TokenSet {
             access_token: tr.access_token,
             // Entra は refresh 時に新しい refresh token を返すことがある（ローテーション）。
@@ -677,16 +647,7 @@ async fn refresh_to(
             expires_at: expires_at_from(tr.expires_in, now_unix()),
         })
     } else {
-        let err: TokenErrorResponse = serde_json::from_slice(&body).unwrap_or(TokenErrorResponse {
-            error: format!("http {}", status.as_u16()),
-            error_description: None,
-        });
-        Err(SplunkError::Auth(format!(
-            "token refresh failed ({}): {}",
-            err.error,
-            err.error_description
-                .unwrap_or_else(|| "run `auth login` again".to_string())
-        )))
+        Err(token_error("token refresh", status, &body))
     }
 }
 
@@ -730,6 +691,9 @@ struct SplunkTokenResponse {
 /// JSON シリアライズはストア保存専用に使う（ログ等には出さない）。
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthSession {
+    /// Older records remain readable for status/logout, but cannot authorize requests.
+    #[serde(default)]
+    pub binding: Option<SessionBinding>,
     /// REST API に Bearer で送る Splunk 発行トークン。
     pub splunk_token: String,
     /// Splunk token の失効 UNIX 時刻（秒）。
@@ -741,6 +705,35 @@ pub struct OAuthSession {
     /// Entra ID の refresh token。Entra access も失効したときの再取得に使う。
     /// 取得できなかった場合は None。
     pub refresh_token: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBinding {
+    version: u32,
+    origin: String,
+    tenant: String,
+    client: String,
+    scopes: Vec<String>,
+}
+
+impl SessionBinding {
+    pub fn new(cfg: &OAuthConfig, base_url: &str) -> Result<Self> {
+        let endpoint = crate::transport::Endpoint::parse(base_url)?;
+        let mut scopes: Vec<String> = cfg
+            .scope_param()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        scopes.sort();
+        scopes.dedup();
+        Ok(Self {
+            version: 1,
+            origin: endpoint.origin(),
+            tenant: cfg.tenant_id.clone(),
+            client: cfg.client_id.clone(),
+            scopes,
+        })
+    }
 }
 
 impl std::fmt::Debug for OAuthSession {
@@ -764,14 +757,33 @@ impl std::fmt::Debug for OAuthSession {
 
 impl OAuthSession {
     /// ログインで得た Entra トークンと交換後の Splunk トークンから組む。
-    pub fn from_login(entra: &TokenSet, splunk: &SplunkToken) -> Self {
-        Self {
+    pub fn from_login(
+        entra: &TokenSet,
+        splunk: &SplunkToken,
+        cfg: &OAuthConfig,
+        base_url: &str,
+    ) -> Result<Self> {
+        Ok(Self {
+            binding: Some(SessionBinding::new(cfg, base_url)?),
             splunk_token: splunk.access_token.clone(),
             splunk_expires_at: splunk.expires_at,
             entra_access_token: entra.access_token.clone(),
             entra_expires_at: entra.expires_at,
             refresh_token: entra.refresh_token.clone(),
+        })
+    }
+
+    pub fn validate(&self, cfg: &OAuthConfig, base_url: &str) -> Result<()> {
+        if self.binding.as_ref() != Some(&SessionBinding::new(cfg, base_url)?) {
+            return Err(SplunkError::Auth("OAuth session does not match this connection or requires migration. Run `auth login` again with trusted configuration.".into()));
         }
+        Ok(())
+    }
+
+    pub fn requires_login(&self) -> bool {
+        self.binding
+            .as_ref()
+            .is_none_or(|binding| binding.version != 1)
     }
 
     /// JSON 文字列へ（ストア保存用）。
@@ -781,7 +793,9 @@ impl OAuthSession {
 
     /// JSON 文字列から復元（ストア読み出し用）。
     pub fn from_json(s: &str) -> Result<Self> {
-        serde_json::from_str(s).map_err(SplunkError::from)
+        serde_json::from_str(s).map_err(|_| {
+            SplunkError::Auth("Invalid stored OAuth session. Run `auth login` again.".into())
+        })
     }
 
     /// Splunk token が（安全マージン込みで）失効しているか。
@@ -819,8 +833,14 @@ pub async fn ensure_fresh_session(
     session: &OAuthSession,
     cfg: &OAuthConfig,
     base_url: &str,
-    http: &reqwest::Client,
+    http: &crate::transport::HttpClient,
 ) -> std::result::Result<Refreshed, RefreshErr> {
+    session
+        .validate(cfg, base_url)
+        .map_err(|error| RefreshErr {
+            error,
+            partial: None,
+        })?;
     let now = now_unix();
     if !session.splunk_expired(now) {
         return Ok(Refreshed {
@@ -908,10 +928,11 @@ pub struct RefreshErr {
 pub async fn exchange_for_splunk_token(
     base_url: &str,
     client_id: &str,
-    http: &reqwest::Client,
+    http: &crate::transport::HttpClient,
     entra_jwt: &str,
 ) -> Result<SplunkToken> {
-    let url = format!("{}/oauth2/v1/token", base_url.trim_end_matches('/'));
+    let endpoint = crate::transport::Endpoint::parse(base_url)?;
+    let url = format!("{}/oauth2/v1/token", endpoint.as_str());
     let resp = http
         .post(&url)
         .form(&[
@@ -929,24 +950,15 @@ pub async fn exchange_for_splunk_token(
     let status = resp.status();
     let body = resp.bytes().await?;
     if status.is_success() {
-        let tr: SplunkTokenResponse = serde_json::from_slice(&body)?;
+        let tr: SplunkTokenResponse = serde_json::from_slice(&body)
+            .map_err(|_| SplunkError::Auth("Invalid token response".into()))?;
         Ok(SplunkToken {
             access_token: tr.access_token,
             // expires_in が無ければ控えめに 1 時間とみなす（Splunk の既定）。
             expires_at: expires_at_from(tr.expires_in.unwrap_or(3600), now_unix()),
         })
     } else {
-        // エラー本文から Splunk のメッセージを短く抜き出す。
-        // 交換リクエストは `client_assertion`（Entra JWT、秘密値）を送るため、
-        // サーバが受信値をエコーする実装だとエラー本文に JWT 断片が混じり得る。
-        // `sanitize_server_text` で JWT 様トークンを伏字にし、制御文字も除いてから出す。
-        let msg = String::from_utf8_lossy(&body);
-        let snippet = sanitize_server_text(&msg, 200);
-        Err(SplunkError::Auth(format!(
-            "Splunk token exchange failed (http {}): {}",
-            status.as_u16(),
-            snippet
-        )))
+        Err(token_error("Splunk token exchange", status, &body))
     }
 }
 
@@ -1126,7 +1138,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.error.as_deref(), Some("access_denied"));
-        assert_eq!(p.error_description.as_deref(), Some("user said no"));
         assert!(p.code.is_none());
     }
 
@@ -1150,9 +1161,14 @@ mod tests {
     #[test]
     fn token_error_response_parses() {
         let json = r#"{"error":"invalid_grant","error_description":"bad code"}"#;
-        let er: TokenErrorResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(er.error, "invalid_grant");
-        assert_eq!(er.error_description.as_deref(), Some("bad code"));
+        let er = token_error(
+            "exchange",
+            reqwest::StatusCode::BAD_REQUEST,
+            json.as_bytes(),
+        )
+        .to_string();
+        assert!(er.contains("invalid_grant"));
+        assert!(!er.contains("bad code"));
     }
 
     // --- authorization_code 交換（mockito で本番ロジックを検証）---
@@ -1197,7 +1213,7 @@ mod tests {
             .create_async()
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::transport::HttpClient::new().unwrap();
         let token_endpoint = format!("{}/token", server.url());
         let tok = exchange_authorization_code_to(
             &token_endpoint,
@@ -1225,7 +1241,7 @@ mod tests {
             .create_async()
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::transport::HttpClient::new().unwrap();
         let token_endpoint = format!("{}/token", server.url());
         let err = exchange_authorization_code_to(
             &token_endpoint,
@@ -1262,7 +1278,7 @@ mod tests {
             .create_async()
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::transport::HttpClient::new().unwrap();
         let token_endpoint = format!("{}/token", server.url());
         let tok = refresh_to(&token_endpoint, &test_cfg(), &http, "old-refresh")
             .await
@@ -1282,7 +1298,7 @@ mod tests {
             .create_async()
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::transport::HttpClient::new().unwrap();
         let token_endpoint = format!("{}/token", server.url());
         let err = refresh_to(&token_endpoint, &test_cfg(), &http, "old")
             .await
@@ -1387,48 +1403,6 @@ mod tests {
         assert!(redirect_resp.contains("splunk-cloud-cli"));
     }
 
-    // --- サーバ由来テキストのサニタイズ ---
-
-    #[test]
-    fn sanitize_masks_jwt_like_tokens() {
-        // header.payload.signature の 3 セグメント JWT を伏字にする。
-        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc-_DEF123";
-        let input = format!("invalid assertion: {} rejected", jwt);
-        let out = sanitize_server_text(&input, 200);
-        assert!(!out.contains("eyJhbGciOiJIUzI1NiJ9"), "JWT leaked: {}", out);
-        assert!(!out.contains(jwt), "JWT leaked: {}", out);
-        assert!(out.contains("***"));
-        // 周囲のテキストは保つ。
-        assert!(out.contains("invalid assertion"));
-        assert!(out.contains("rejected"));
-    }
-
-    #[test]
-    fn sanitize_strips_control_characters() {
-        // ANSI エスケープ等の制御文字を端末へ出さない。
-        let input = "error\x1b[31m red \x07 bell\ndesc";
-        let out = sanitize_server_text(input, 200);
-        assert!(!out.contains('\x1b'));
-        assert!(!out.contains('\x07'));
-        assert!(!out.contains('\n'));
-        assert!(out.contains("error"));
-        assert!(out.contains("desc"));
-    }
-
-    #[test]
-    fn sanitize_truncates_length() {
-        let input = "a".repeat(500);
-        let out = sanitize_server_text(&input, 200);
-        assert_eq!(out.chars().count(), 200);
-    }
-
-    #[test]
-    fn sanitize_keeps_ordinary_error_codes() {
-        // 通常の OAuth エラーコード・説明はそのまま通す。
-        let out = sanitize_server_text("invalid_grant: code already redeemed", 200);
-        assert_eq!(out, "invalid_grant: code already redeemed");
-    }
-
     // --- run_authorization_code_flow の結線テスト ---
     //
     // 任意ポートで bind した listener と mockito の token エンドポイント、短い
@@ -1475,7 +1449,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         spawn_redirect(addr, "GET /callback?code=REALCODE&state=S HTTP/1.1");
 
-        let http = reqwest::Client::new();
+        let http = crate::transport::HttpClient::new().unwrap();
         let prompt = noop_prompt();
         let tok = run_authorization_code_flow(
             &format!("{}/token", server.url()),
@@ -1500,7 +1474,7 @@ mod tests {
         // redirect は state=WRONG を返す。期待 state は "EXPECTED"。
         spawn_redirect(addr, "GET /callback?code=C&state=WRONG HTTP/1.1");
 
-        let http = reqwest::Client::new();
+        let http = crate::transport::HttpClient::new().unwrap();
         let prompt = noop_prompt();
         let err = run_authorization_code_flow(
             "http://unused.invalid/token",
@@ -1530,7 +1504,7 @@ mod tests {
             "GET /callback?error=access_denied&error_description=user%20declined&state=S HTTP/1.1",
         );
 
-        let http = reqwest::Client::new();
+        let http = crate::transport::HttpClient::new().unwrap();
         let prompt = noop_prompt();
         let err = run_authorization_code_flow(
             "http://unused.invalid/token",
@@ -1546,7 +1520,7 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("access_denied"), "got: {}", msg);
-        assert!(msg.contains("user declined"), "got: {}", msg);
+        assert!(!msg.contains("user declined"), "got: {}", msg);
     }
 
     #[tokio::test]
@@ -1560,7 +1534,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         spawn_redirect(addr, "GET /callback?error=&state=S HTTP/1.1");
 
-        let http = reqwest::Client::new();
+        let http = crate::transport::HttpClient::new().unwrap();
         let prompt = noop_prompt();
         let err = run_authorization_code_flow(
             "http://unused.invalid/token",
@@ -1585,7 +1559,7 @@ mod tests {
     async fn flow_times_out_without_redirect() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         // redirect を一切送らない。短い wait で即タイムアウトさせる。
-        let http = reqwest::Client::new();
+        let http = crate::transport::HttpClient::new().unwrap();
         let prompt = noop_prompt();
         let err = run_authorization_code_flow(
             "http://unused.invalid/token",

@@ -42,25 +42,37 @@ const SECRET_ENV: &[&str] = &["SPLUNK_TOKEN", "SPLUNK_SESSION_KEY", "SPLUNK_PASS
 /// チェックが問題を報告したら非ゼロ終了するため `Ok(false)` を返す。
 /// 呼び出し側（main）は戻り値を見て exit code を決める。
 pub async fn run(no_connect: bool, strict: bool) -> Result<bool> {
+    run_with_config(no_connect, strict, None).await
+}
+
+pub async fn run_with_config(
+    no_connect: bool,
+    strict: bool,
+    config: Option<&Path>,
+) -> Result<bool> {
     // load_settings() のエラーは握り潰さず捕捉する。config.toml が存在しても
     // TOML パースに失敗すると、実コマンドは `load_settings()?` でエラー終了する。
     // doctor が黙って Settings::default() に倒れると、本来「ファイルが壊れている」
     // のに「設定値が未設定」と誤診断してしまうため、パースエラーを CONFIG ブロックで
     // 明示し、解決済み設定としては空（default）を使う。
-    let (settings, load_error) = match crate::config::load_settings() {
+    let (settings, load_error) = match crate::config::load_settings_from(config) {
         Ok(s) => (s, None),
         Err(e) => (Settings::default(), Some(e.to_string())),
     };
-    let store = default_store();
-    let store_ref = store.as_deref();
-
     let mut healthy = true;
 
     println!("splunk-cloud-cli {}", env!("CARGO_PKG_VERSION"));
     println!();
 
-    healthy &= print_config_block(load_error.as_deref());
+    healthy &= print_config_block(config, load_error.as_deref());
     println!();
+
+    if load_error.is_some() {
+        println!("Further checks skipped: configuration could not be loaded.");
+        return Ok(!strict);
+    }
+    let store = default_store();
+    let store_ref = store.as_deref();
 
     healthy &= print_credentials_block(&settings, store_ref);
     println!();
@@ -87,9 +99,11 @@ pub async fn run(no_connect: bool, strict: bool) -> Result<bool> {
 /// 同じく先頭の存在ファイルがパースエラーの対象になる。
 ///
 /// 戻り値は「CONFIG が健全か」。パースエラーがあれば false。
-fn print_config_block(load_error: Option<&str>) -> bool {
+fn print_config_block(config: Option<&Path>, load_error: Option<&str>) -> bool {
     println!("CONFIG");
-    let paths = config_search_paths();
+    let paths = config
+        .map(|p| vec![p.to_owned()])
+        .unwrap_or_else(config_search_paths);
     let found = paths.iter().find(|p| p.exists());
     match found {
         Some(path) => {
@@ -112,6 +126,10 @@ fn print_config_block(load_error: Option<&str>) -> bool {
             println!("  searched:");
             for p in &paths {
                 println!("    - {}", p.display());
+            }
+            if let Some(err) = load_error {
+                println!("  error:   {}", err);
+                return false;
             }
             // 設定ファイルが無いのは異常ではない（env / Keychain 経由もありうる）。
             config_healthy(false, load_error)
@@ -167,7 +185,9 @@ fn print_credentials_block(settings: &Settings, store: Option<&dyn CredentialSto
             println!("  base-url:      {}  ({})", url, src);
         }
         Err(_) => {
-            println!("  base-url:      (UNRESOLVABLE: set SPLUNK_BASE_URL or config `base_url`)");
+            println!(
+                "  base-url:      (UNRESOLVABLE: set a valid SPLUNK_BASE_URL or config `base_url`)"
+            );
             healthy = false;
         }
     }
@@ -177,24 +197,25 @@ fn print_credentials_block(settings: &Settings, store: Option<&dyn CredentialSto
     // resolve_credentials は env+store+toml をまとめた `token` を OAuth より先に
     // 評価する（config/mod.rs の `if let Some(t) = token` が oauth_auto より前）。
     // よって手動 token（store/toml）は OAuth session より優先される。
-    let token_src = secret_source("SPLUNK_TOKEN", store, KEY_TOKEN, settings.token.is_some());
-    // OAuth セッションの「存在」と「実際に使えるか」を分ける。resolve_credentials は
-    // セッションが store にあっても、tenant/client（resolve_oauth_config）と base_url
-    // が解決できなければ OAuth を採用しない（resolve_oauth_auto が None を返す）。
-    // doctor もこの条件をそろえないと、設定が欠けた OAuth を「使える」と偽診断する。
+    let token_src = secret_source(
+        "SPLUNK_TOKEN",
+        store,
+        KEY_TOKEN,
+        settings.token.as_ref().is_some_and(|v| !v.is_empty()),
+    );
     let oauth_present = oauth_session_present(store);
-    let oauth_usable = oauth_present && oauth_config_resolvable(settings);
+    let oauth_state = oauth_state(settings, store, token_src.resolved_label().is_some());
     let session_key_src = secret_source(
         "SPLUNK_SESSION_KEY",
         store,
         KEY_SESSION_KEY,
-        settings.session_key.is_some(),
+        settings.session_key.as_ref().is_some_and(|v| !v.is_empty()),
     );
     let password_src = secret_source(
         "SPLUNK_PASSWORD",
         store,
         KEY_PASSWORD,
-        settings.password.is_some(),
+        settings.password.as_ref().is_some_and(|v| !v.is_empty()),
     );
     let username = std::env::var("SPLUNK_USERNAME")
         .ok()
@@ -215,17 +236,6 @@ fn print_credentials_block(settings: &Settings, store: Option<&dyn CredentialSto
         }
     }
 
-    // OAuth セッションは保存されているが、tenant/client/base_url が欠けて実際には
-    // 使えないケースを告知する。token 優先で OAuth が後回しになる場合（token_src あり）は
-    // 後段の "not used; manual token takes precedence" 行で説明されるため、ここでは
-    // token が無く OAuth がフォールバック候補になりうる場合に限って警告する。
-    if oauth_present && !oauth_usable && token_src.resolved_label().is_none() {
-        println!("  oauth-session: stored but UNUSABLE");
-        println!("                 oauth_tenant_id / oauth_client_id / base_url must resolve");
-        println!("                 for the session to be used. `auth login` will not take effect.");
-        healthy = false;
-    }
-
     let env_token_set = env_set("SPLUNK_TOKEN");
     if let Some(src) = token_src.resolved_label() {
         // env SPLUNK_TOKEN は OAuth より優先される。
@@ -239,7 +249,12 @@ fn print_credentials_block(settings: &Settings, store: Option<&dyn CredentialSto
         } else {
             println!("  auth-method:   bearer-token  (from {})", src);
         }
-    } else if oauth_usable {
+    } else if oauth_state == OAuthState::Blocked {
+        println!("  auth-method:   BLOCKED (OAuth session cannot be safely used)");
+        println!("                 Check credential-store access and run `auth login` again");
+        println!("                 with trusted configuration. No credential fallback is allowed.");
+        healthy = false;
+    } else if oauth_state == OAuthState::Usable {
         println!("  auth-method:   oauth2  (OAuth session in credential store)");
         print_oauth_config_line(settings);
     } else if let Some(src) = session_key_src.resolved_label() {
@@ -300,7 +315,7 @@ fn print_environment_block() {
     println!("ENVIRONMENT");
     for key in NON_SECRET_ENV {
         match std::env::var(key) {
-            Ok(v) if !v.is_empty() => println!("  {:30} {}", key, v),
+            Ok(v) if !v.is_empty() => println!("  {:30} {}", key, environment_value(key, &v)),
             _ => println!("  {:30} (unset)", key),
         }
     }
@@ -318,6 +333,15 @@ fn print_environment_block() {
     }
 }
 
+fn environment_value(key: &str, value: &str) -> String {
+    if key == "SPLUNK_BASE_URL" {
+        return crate::transport::Endpoint::parse(value)
+            .map(|endpoint| endpoint.as_str().to_owned())
+            .unwrap_or_else(|_| "(invalid base URL)".to_owned());
+    }
+    value.to_owned()
+}
+
 /// CONNECTIVITY ブロック。base_url へ HEAD して status と所要時間を出す。
 /// 認証は付けない（到達性のみ確認）。401 は「到達はできている」と解釈する。
 ///
@@ -328,19 +352,20 @@ async fn print_connectivity_block(settings: &Settings) -> bool {
     let base_url = match resolve_base_url(settings) {
         Ok(u) => u,
         Err(_) => {
-            println!("  (skipped: base_url not set)");
+            println!("  (skipped: base_url missing or invalid)");
             return false;
         }
     };
 
     let client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("splunk-cloud-cli/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(10))
         .build()
     {
         Ok(c) => c,
-        Err(e) => {
-            println!("  HEAD {}  ->  client build failed: {}", base_url, e);
+        Err(_) => {
+            println!("  HEAD {}  ->  client build failed", base_url);
             return false;
         }
     };
@@ -369,9 +394,9 @@ fn connect_error_reason(e: &reqwest::Error) -> String {
     if e.is_timeout() {
         "timed out".to_string()
     } else if e.is_connect() {
-        format!("connection failed: {}", e)
+        "connection failed".to_string()
     } else {
-        format!("request failed: {}", e)
+        "request failed".to_string()
     }
 }
 
@@ -439,14 +464,28 @@ fn oauth_session_present(store: Option<&dyn CredentialStore>) -> bool {
     matches!(store_has(store, KEY_OAUTH_SESSION), StorePresence::Found)
 }
 
-/// OAuth セッションが実際に使える設定がそろっているか。
-///
-/// resolve_oauth_auto（config/mod.rs）が OAuth を採用する条件のうち、設定由来の
-/// 2 条件（tenant/client が resolve_oauth_config で解決でき、base_url が解決できる）を
-/// 確認する。セッション JSON のパース可否までは見ないが、設定欠落による偽陽性
-/// （セッションは在るが tenant/client 未設定で実際は使えない）を防ぐのが目的。
-fn oauth_config_resolvable(settings: &Settings) -> bool {
-    crate::config::resolve_oauth_config(settings).is_ok() && resolve_base_url(settings).is_ok()
+#[derive(Debug, PartialEq, Eq)]
+enum OAuthState {
+    Unused,
+    Usable,
+    Blocked,
+}
+
+/// 実リクエストと同じセッション検証を使い、binding 不一致やストア障害で
+/// session-key / Basic へフォールバックできるようには表示しない。
+fn oauth_state(
+    settings: &Settings,
+    store: Option<&dyn CredentialStore>,
+    manual_token: bool,
+) -> OAuthState {
+    if manual_token {
+        return OAuthState::Unused;
+    }
+    match crate::config::resolve_oauth_auto(settings, store) {
+        Ok(Some(_)) => OAuthState::Usable,
+        Ok(None) => OAuthState::Unused,
+        Err(_) => OAuthState::Blocked,
+    }
 }
 
 enum StorePresence {
@@ -479,9 +518,7 @@ mod tests {
     use crate::config::credential_store::test_support::{
         FailingStore, MemoryStore, UnavailableStore,
     };
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_support::ENV_LOCK;
 
     fn clear_env() {
         for k in [
@@ -632,36 +669,80 @@ mod tests {
         assert!(config_healthy(false, Some("ignored")));
     }
 
-    // --- finding #2: OAuth セッションが在っても設定が欠ければ usable でない ---
-
     #[test]
-    fn oauth_config_resolvable_requires_tenant_client_and_base_url() {
+    fn oauth_state_checks_binding_and_blocks_fallback() {
         let _lock = ENV_LOCK.lock().unwrap();
         clear_env();
-
-        // tenant/client/base_url がすべてそろえば usable。
         let full = Settings {
-            base_url: Some("https://x.splunkcloud.com:8089".into()),
+            base_url: Some("https://service.example:8089".into()),
             oauth_tenant_id: Some("tenant".into()),
             oauth_client_id: Some("client".into()),
+            session_key: Some("dummy-session-key".into()),
+            username: Some("dummy-user".into()),
+            password: Some("dummy-password".into()),
             ..Settings::default()
         };
-        assert!(oauth_config_resolvable(&full));
+        let cfg = crate::config::resolve_oauth_config(&full).unwrap();
+        let mut session = crate::oauth::OAuthSession {
+            binding: Some(
+                crate::oauth::SessionBinding::new(&cfg, full.base_url.as_deref().unwrap()).unwrap(),
+            ),
+            splunk_token: "dummy-token".into(),
+            splunk_expires_at: u64::MAX,
+            entra_access_token: "dummy-access".into(),
+            entra_expires_at: u64::MAX,
+            refresh_token: None,
+        };
+        let store = MemoryStore::new();
+        assert_eq!(oauth_state(&full, Some(&store), false), OAuthState::Unused);
+        store
+            .set(KEY_OAUTH_SESSION, &session.to_json().unwrap())
+            .unwrap();
+        assert_eq!(oauth_state(&full, Some(&store), false), OAuthState::Usable);
+        let mut mismatch = full.clone();
+        mismatch.base_url = Some("https://other.example:8089".into());
+        assert_eq!(
+            oauth_state(&mismatch, Some(&store), false),
+            OAuthState::Blocked
+        );
+        assert!(!print_credentials_block(&mismatch, Some(&store)));
+        session.binding = None;
+        store
+            .set(KEY_OAUTH_SESSION, &session.to_json().unwrap())
+            .unwrap();
+        assert_eq!(oauth_state(&full, Some(&store), false), OAuthState::Blocked);
+        assert!(!print_credentials_block(&full, Some(&store)));
+        store.set(KEY_OAUTH_SESSION, "invalid-json").unwrap();
+        assert_eq!(oauth_state(&full, Some(&store), false), OAuthState::Blocked);
+        assert_eq!(oauth_state(&full, Some(&store), true), OAuthState::Unused);
+        assert_eq!(
+            oauth_state(&full, Some(&FailingStore), false),
+            OAuthState::Blocked
+        );
+        assert_eq!(
+            oauth_state(&full, Some(&FailingStore), true),
+            OAuthState::Unused
+        );
+        let mut manual = full.clone();
+        manual.token = Some("dummy-manual".into());
+        assert!(print_credentials_block(&manual, Some(&store)));
+    }
 
-        // tenant/client があっても base_url が無ければ usable でない。
-        let no_base = Settings {
-            oauth_tenant_id: Some("tenant".into()),
-            oauth_client_id: Some("client".into()),
-            ..Settings::default()
-        };
-        assert!(!oauth_config_resolvable(&no_base));
-
-        // base_url があっても tenant/client が無ければ usable でない。
-        // これがセッションだけ在って tenant/client 未設定の偽陽性ケースに対応する。
-        let no_oauth_cfg = Settings {
-            base_url: Some("https://x.splunkcloud.com:8089".into()),
-            ..Settings::default()
-        };
-        assert!(!oauth_config_resolvable(&no_oauth_cfg));
+    #[test]
+    fn environment_url_diagnostics_never_echo_invalid_input() {
+        for value in [
+            "https://user:DUMMY_SECRET@example.com",
+            "https://example.com?token=DUMMY_SECRET",
+            "https://example.com/DUMMY_SECRET",
+        ] {
+            assert_eq!(
+                environment_value("SPLUNK_BASE_URL", value),
+                "(invalid base URL)"
+            );
+        }
+        assert_eq!(
+            environment_value("SPLUNK_BASE_URL", "https://example.com:8089/"),
+            "https://example.com:8089"
+        );
     }
 }

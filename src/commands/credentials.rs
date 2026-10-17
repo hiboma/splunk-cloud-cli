@@ -14,10 +14,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::{CredentialField, CredentialsCmd};
-use crate::config::config_search_paths;
 use crate::config::credential_store::{
     default_store, CredentialStore, KEY_PASSWORD, KEY_SESSION_KEY, KEY_TOKEN,
 };
+use crate::config::{parse_settings, selected_config_path};
 use crate::error::{Result, SplunkError};
 
 /// 平文機密を含みうるファイルの permission。
@@ -25,6 +25,14 @@ const SECRET_FILE_MODE: u32 = 0o600;
 
 /// `credentials` サブコマンドのエントリポイント。
 pub fn run(cmd: &CredentialsCmd) -> Result<()> {
+    run_with_config(cmd, None)
+}
+
+pub fn run_with_config(cmd: &CredentialsCmd, config: Option<&Path>) -> Result<()> {
+    if matches!(cmd, CredentialsCmd::Migrate { .. }) {
+        // 設定エラーは credential store に触れる前に返す。
+        crate::config::load_settings_from(config)?;
+    }
     let store = default_store().ok_or_else(|| {
         SplunkError::Config(
             "no credential store backend available on this platform (macOS Keychain required)"
@@ -36,7 +44,7 @@ pub fn run(cmd: &CredentialsCmd) -> Result<()> {
         CredentialsCmd::Set { field, stdin } => set_value(store.as_ref(), *field, *stdin),
         CredentialsCmd::Delete { field } => delete_value(store.as_ref(), *field),
         CredentialsCmd::Status => print_status(store.as_ref()),
-        CredentialsCmd::Migrate { dry_run } => migrate(store.as_ref(), *dry_run),
+        CredentialsCmd::Migrate { dry_run } => migrate(store.as_ref(), *dry_run, config),
     }
 }
 
@@ -97,8 +105,18 @@ fn print_status(store: &dyn CredentialStore) -> Result<()> {
 /// 1. 先に Keychain へ書く（toml は未変更なので失敗しても無傷）。
 /// 2. ユーザーに「原本の扱い（削除 or バックアップ残し）」を聞く。
 /// 3. rewrite 失敗時は Keychain の該当エントリをロールバックする。
-fn migrate(store: &dyn CredentialStore, dry_run: bool) -> Result<()> {
-    let path = find_config_toml().ok_or_else(|| {
+fn migrate(store: &dyn CredentialStore, dry_run: bool, config: Option<&Path>) -> Result<()> {
+    migrate_with_prompts(store, dry_run, config, prompt_yes_no, prompt_disposal)
+}
+
+fn migrate_with_prompts(
+    store: &dyn CredentialStore,
+    dry_run: bool,
+    config: Option<&Path>,
+    confirm: impl FnOnce(&str, bool) -> Result<bool>,
+    disposal: impl FnOnce() -> Result<DisposalMode>,
+) -> Result<()> {
+    let path = selected_config_path(config)?.ok_or_else(|| {
         SplunkError::Config(
             "no config.toml found to migrate from. \
              To store a secret directly in the Keychain, run: \
@@ -106,12 +124,15 @@ fn migrate(store: &dyn CredentialStore, dry_run: bool) -> Result<()> {
                 .to_string(),
         )
     })?;
-    let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-    println!("Found config.toml: {}", canonical.display());
+    // Resolve once so reads, backups and atomic replacement all use the same
+    // target. Renaming over the supplied symlink would leave its secrets intact.
+    let path = fs::canonicalize(&path)
+        .map_err(|e| SplunkError::Config(format!("failed to resolve {}: {}", path.display(), e)))?;
+    println!("Found config.toml: {}", path.display());
 
-    let original = fs::read_to_string(&path).map_err(|e| {
-        SplunkError::Config(format!("failed to read {}: {}", canonical.display(), e))
-    })?;
+    let original = fs::read_to_string(&path)
+        .map_err(|e| SplunkError::Config(format!("failed to read {}: {}", path.display(), e)))?;
+    parse_settings(&original, &path)?;
 
     // 3 フィールドを一括で走査する。`Unsupported` はフィールドごとに即座にエラーにして、
     // 「片方だけ成功して片方は壊れた toml を残す」ような中途半端を避ける。
@@ -154,11 +175,11 @@ fn migrate(store: &dyn CredentialStore, dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    if !prompt_yes_no(
+    if !confirm(
         &format!(
             "Migrate {} secret(s) from {} to the credential store?",
             present.len(),
-            canonical.display()
+            path.display()
         ),
         false,
     )? {
@@ -187,7 +208,7 @@ fn migrate(store: &dyn CredentialStore, dry_run: bool) -> Result<()> {
     // という誤解を招き、`credentials status` との整合も崩れる。migrate の契約は
     // 「config.toml からすべての秘密フィールドを除去する」と一貫させる。
     let toml_keys: [&str; 3] = ["token", "session_key", "password"];
-    let mode = prompt_disposal()?;
+    let mode = disposal()?;
     let updated = remove_fields(&original, &toml_keys);
 
     match mode {
@@ -196,13 +217,13 @@ fn migrate(store: &dyn CredentialStore, dry_run: bool) -> Result<()> {
                 rollback_store(store, &written);
                 return Err(SplunkError::Config(format!(
                     "failed to update {}: {}. Credential store entries rolled back.",
-                    canonical.display(),
+                    path.display(),
                     e
                 )));
             }
-            println!("Removed migrated secret lines from {}", canonical.display());
+            println!("Removed migrated secret lines from {}", path.display());
             println!();
-            println!("Done. The plaintext secret(s) no longer exist on disk.");
+            println!("Done. Migrated secret lines were removed from the config file.");
         }
         DisposalMode::KeepBackup => {
             let backup = backup_path(&path);
@@ -219,13 +240,13 @@ fn migrate(store: &dyn CredentialStore, dry_run: bool) -> Result<()> {
                 rollback_store(store, &written);
                 return Err(SplunkError::Config(format!(
                     "failed to update {}: {}. Credential store entries rolled back.",
-                    canonical.display(),
+                    path.display(),
                     e
                 )));
             }
             println!(
                 "Removed migrated secret lines from {} (backup at {})",
-                canonical.display(),
+                path.display(),
                 backup.display()
             );
             println!();
@@ -330,10 +351,6 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     })
 }
 
-fn find_config_toml() -> Option<PathBuf> {
-    config_search_paths().into_iter().find(|p| p.is_file())
-}
-
 fn backup_path(p: &Path) -> PathBuf {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -428,6 +445,87 @@ fn remove_fields(content: &str, keys: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::credential_store::test_support::MemoryStore;
+
+    #[test]
+    fn migrate_symlink_rewrites_target_and_preserves_link() {
+        for mode in [DisposalMode::Remove, DisposalMode::KeepBackup] {
+            let dir = tempfile::tempdir().unwrap();
+            let target_dir = dir.path().join("target");
+            fs::create_dir(&target_dir).unwrap();
+            let target = target_dir.join("config.toml");
+            let link = dir.path().join("linked.toml");
+            let original = "base_url = \"https://example.test\"\ntoken = \"dummy-token\"\nsession_key = \"dummy-session\"\npassword = \"dummy-password\"\n";
+            fs::write(&target, original).unwrap();
+            std::os::unix::fs::symlink("target/config.toml", &link).unwrap();
+            let store = MemoryStore::new();
+
+            migrate_with_prompts(&store, false, Some(&link), |_, _| Ok(true), || Ok(mode)).unwrap();
+
+            assert!(fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            let updated = fs::read_to_string(&target).unwrap();
+            assert_eq!(updated, "base_url = \"https://example.test\"\n");
+            assert_eq!(fs::read_to_string(&link).unwrap(), updated);
+            assert_eq!(
+                store.get(KEY_TOKEN).unwrap().as_deref(),
+                Some("dummy-token")
+            );
+            assert_eq!(
+                store.get(KEY_SESSION_KEY).unwrap().as_deref(),
+                Some("dummy-session")
+            );
+            assert_eq!(
+                store.get(KEY_PASSWORD).unwrap().as_deref(),
+                Some("dummy-password")
+            );
+            let backups: Vec<_> = fs::read_dir(&target_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .contains(".bak.")
+                })
+                .collect();
+            if mode == DisposalMode::KeepBackup {
+                assert_eq!(backups.len(), 1);
+                assert_eq!(fs::read_to_string(&backups[0]).unwrap(), original);
+                assert_eq!(
+                    fs::metadata(&backups[0]).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            } else {
+                assert!(backups.is_empty());
+            }
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+        }
+    }
+
+    #[test]
+    fn migrate_dangling_symlink_fails_before_store_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("linked.toml");
+        std::os::unix::fs::symlink("missing.toml", &link).unwrap();
+        let store = MemoryStore::new();
+        let error = migrate_with_prompts(
+            &store,
+            false,
+            Some(&link),
+            |_, _| panic!("must not prompt on resolution failure"),
+            || panic!("must not prompt on resolution failure"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("failed to resolve"));
+        assert_eq!(store.get(KEY_TOKEN).unwrap(), None);
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
 
     #[test]
     fn extract_token() {
