@@ -154,23 +154,23 @@ fn mask(v: &Option<String>) -> &'static str {
 
 /// 設定ファイルの探索パス（優先度順）。
 ///
-/// 1. カレントディレクトリの `.splunk-cloud-cli.toml`
-/// 2. `$XDG_CONFIG_HOME/splunk-cloud-cli/config.toml`
-/// 3. `~/.config/splunk-cloud-cli/config.toml`
+/// `$XDG_CONFIG_HOME/splunk-cloud-cli/config.toml`、または未設定・空値時は
+/// `~/.config/splunk-cloud-cli/config.toml`。CWD の設定は暗黙には読まない。
 pub fn config_search_paths() -> Vec<PathBuf> {
-    let mut paths = vec![PathBuf::from(".splunk-cloud-cli.toml")];
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        paths.push(
-            PathBuf::from(xdg)
-                .join("splunk-cloud-cli")
-                .join("config.toml"),
-        );
+    let mut paths = Vec::new();
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        let root = PathBuf::from(xdg);
+        if root.is_absolute() {
+            paths.push(root.join("splunk-cloud-cli").join("config.toml"));
+        }
     } else if let Some(home) = dirs::home_dir() {
-        paths.push(
-            home.join(".config")
-                .join("splunk-cloud-cli")
-                .join("config.toml"),
-        );
+        if home.is_absolute() {
+            paths.push(
+                home.join(".config")
+                    .join("splunk-cloud-cli")
+                    .join("config.toml"),
+            );
+        }
     }
     paths
 }
@@ -183,20 +183,67 @@ pub fn config_search_paths() -> Vec<PathBuf> {
 /// ファイル権限が他ユーザーから読める状態だと秘密情報が漏れるため、
 /// 秘密情報を含むファイルがワールドリーダブルなら `stderr` に警告を出す。
 pub fn load_settings() -> Result<Settings> {
-    for path in config_search_paths() {
-        if !path.exists() {
-            continue;
-        }
-        let content = std::fs::read_to_string(&path)?;
-        let settings: Settings = toml::from_str(&content).map_err(|e| {
-            SplunkError::Config(format!("failed to parse {}: {}", path.display(), e))
-        })?;
-        if settings.has_secret() {
-            warn_if_world_readable(&path);
-        }
-        return Ok(settings);
+    load_settings_from(None)
+}
+
+/// 明示指定したファイルは存在しなくてもそのパスを返し、読み込み時に失敗させる。
+pub fn selected_config_path(explicit: Option<&std::path::Path>) -> Result<Option<PathBuf>> {
+    if let Some(path) = explicit {
+        return Ok(Some(path.to_owned()));
     }
-    Ok(Settings::default())
+    if std::env::var_os("XDG_CONFIG_HOME")
+        .is_some_and(|v| !v.is_empty() && !PathBuf::from(v).is_absolute())
+    {
+        return Err(SplunkError::Config(
+            "XDG_CONFIG_HOME must be an absolute path, or use --config to select a trusted file."
+                .into(),
+        ));
+    }
+    for path in config_search_paths() {
+        if path.try_exists()? {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+/// CLI の `--config` 指定を優先し、指定がなければユーザー設定だけを読む。
+pub fn load_settings_from(explicit: Option<&std::path::Path>) -> Result<Settings> {
+    let Some(path) = selected_config_path(explicit)? else {
+        return Ok(Settings::default());
+    };
+    let content = std::fs::read_to_string(&path).map_err(|_| {
+        SplunkError::Config(format!("failed to read config file {}", path.display()))
+    })?;
+    let settings = parse_settings(&content, &path)?;
+    if settings.has_secret() {
+        warn_if_world_readable(&path);
+    }
+    Ok(settings)
+}
+
+/// TOML の診断には入力行や未知の値が含まれるため、その表示文字列は使わない。
+pub fn parse_settings(content: &str, path: &std::path::Path) -> Result<Settings> {
+    toml::from_str(content).map_err(|e: toml::de::Error| {
+        let location = e
+            .span()
+            .map(|span| {
+                let offset = span.start.min(content.len());
+                let prefix = &content.as_bytes()[..offset];
+                let line = prefix.iter().filter(|&&b| b == b'\n').count() + 1;
+                let column = prefix
+                    .iter()
+                    .rposition(|&b| b == b'\n')
+                    .map_or(offset + 1, |last| offset - last);
+                format!(" at line {}, column {}", line, column)
+            })
+            .unwrap_or_default();
+        SplunkError::Config(format!(
+            "failed to parse {}{}: invalid TOML configuration",
+            path.display(),
+            location
+        ))
+    })
 }
 
 impl Settings {
@@ -333,15 +380,14 @@ pub fn resolve_credentials_with_store(
 
     let env_token = std::env::var("SPLUNK_TOKEN").ok().filter(|s| !s.is_empty());
 
-    // OAuth セッション（`auth login` 由来）を store から読む。env SPLUNK_TOKEN が
-    // 明示されている場合は、そのユーザー指定の固定値を優先し OAuth は使わない。
-    let oauth_auto = if env_token.is_none() {
-        resolve_oauth_auto(settings, store)
+    let token = resolve_secret(env_token, store, KEY_TOKEN, settings.token.clone());
+    // Select provenance before consulting OAuth. Equal secret values must not
+    // turn a manually supplied token into an automatically refreshed session.
+    let oauth_auto = if token.is_none() {
+        resolve_oauth_auto(settings, store)?
     } else {
         None
     };
-
-    let token = resolve_secret(env_token, store, KEY_TOKEN, settings.token.clone());
     let session_key = resolve_secret(
         std::env::var("SPLUNK_SESSION_KEY").ok(),
         store,
@@ -358,8 +404,8 @@ pub fn resolve_credentials_with_store(
         settings.password.clone(),
     );
 
-    // 認証方式の決定。優先度: env SPLUNK_TOKEN（= token, 上で解決）
-    //   → OAuth セッション（自動更新つき） → 手動 token → session_key → Basic。
+    // 認証方式の決定。優先度: 手動 token（env / store / TOML）
+    //   → OAuth セッション（自動更新つき） → session_key → Basic。
     // OAuth セッションは初期 Bearer に Splunk token を入れ、Authorizer が失効時に
     // 自動更新する。
     let auth = if let Some(t) = token {
@@ -398,16 +444,7 @@ one via `splunk-cloud-cli credentials set`."
 
     // OAuth 自動更新は、auth が OAuth セッション由来の BearerToken のときだけ有効。
     // env SPLUNK_TOKEN や手動 token / session_key / Basic のときは無効。
-    let oauth = match &auth {
-        AuthMethod::BearerToken(t)
-            if oauth_auto
-                .as_ref()
-                .is_some_and(|a| a.session.splunk_token == *t) =>
-        {
-            oauth_auto
-        }
-        _ => None,
-    };
+    let oauth = oauth_auto;
 
     Ok(Credentials {
         base_url,
@@ -424,36 +461,38 @@ fn first_non_empty(candidates: &[Option<String>]) -> Option<String> {
     candidates.iter().flatten().find(|s| !s.is_empty()).cloned()
 }
 
-/// credential store に OAuth セッションがあり、OAuth 設定（tenant/client）と
-/// base_url が解決できる場合のみ `OAuthAuto` を返す。いずれか欠ければ `None`。
-///
-/// `None` を返しても致命的ではない（自動更新が効かないだけ）。OAuth 設定や
-/// セッションの欠落をエラーにしないのは、手動 token / session_key 等の
-/// ユーザーを巻き込まないため。
-fn resolve_oauth_auto(
+/// Return an OAuth context only when its saved identity matches this connection.
+/// Missing/unavailable storage is distinct from an invalid or mismatched session:
+/// the latter must stop resolution rather than fall back to another credential.
+pub(crate) fn resolve_oauth_auto(
     settings: &Settings,
     store: Option<&dyn CredentialStore>,
-) -> Option<OAuthAuto> {
-    let store = store?;
-    // store から OAuth セッション（JSON）を読む。バックエンド障害や未保存は None。
-    let raw = store.get(KEY_OAUTH_SESSION).ok().flatten()?;
-    if raw.is_empty() {
-        return None;
-    }
-    let session = crate::oauth::OAuthSession::from_json(&raw).ok()?;
-    let config = resolve_oauth_config(settings).ok()?;
-    let base_url = resolve_base_url(settings).ok()?;
-    Some(OAuthAuto {
+) -> Result<Option<OAuthAuto>> {
+    let Some(store) = store else { return Ok(None) };
+    let raw = match store.get(KEY_OAUTH_SESSION) {
+        Ok(Some(raw)) if !raw.is_empty() => raw,
+        Ok(_) | Err(StoreError::Unavailable(_)) => return Ok(None),
+        Err(StoreError::Backend(_)) => {
+            return Err(SplunkError::Config(
+                "Cannot read OAuth credentials; no credential set can be safely selected.".into(),
+            ))
+        }
+    };
+    let session = crate::oauth::OAuthSession::from_json(&raw)?;
+    let config = resolve_oauth_config(settings)?;
+    let base_url = resolve_base_url(settings)?;
+    session.validate(&config, &base_url)?;
+    Ok(Some(OAuthAuto {
         session,
         config,
         base_url,
-    })
+    }))
 }
 
 /// 接続先 base_url を「env → config.toml」の優先順で解決する。
 /// `auth login`（token 交換のため接続先が必要）と `resolve_credentials` が使う。
 pub fn resolve_base_url(settings: &Settings) -> Result<String> {
-    std::env::var("SPLUNK_BASE_URL")
+    let value = std::env::var("SPLUNK_BASE_URL")
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| settings.base_url.clone())
@@ -463,7 +502,10 @@ pub fn resolve_base_url(settings: &Settings) -> Result<String> {
 Example: export SPLUNK_BASE_URL=https://<stack>.splunkcloud.com:8089"
                     .to_string(),
             )
-        })
+        })?;
+    Ok(crate::transport::Endpoint::parse(&value)?
+        .as_str()
+        .to_owned())
 }
 
 /// Entra ID OAuth 設定を「env → config.toml」の優先順で解決する。
@@ -515,12 +557,7 @@ pub fn resolve_oauth_config(settings: &Settings) -> Result<crate::oauth::OAuthCo
 mod tests {
     use super::credential_store::test_support::MemoryStore;
     use super::*;
-    use std::sync::Mutex;
-
-    /// resolve 系テストは HOME / XDG_CONFIG_HOME / SPLUNK_* を触るため、
-    /// cargo test のデフォルトスレッドプールで並列実行すると順序依存になる。
-    /// 直列化のため共有 Mutex を用意する。
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_support::ENV_LOCK;
 
     fn clear_splunk_env() {
         for k in [
@@ -531,6 +568,9 @@ mod tests {
             "SPLUNK_PASSWORD",
             "SPLUNK_APP",
             "SPLUNK_USER",
+            "SPLUNK_OAUTH_TENANT_ID",
+            "SPLUNK_OAUTH_CLIENT_ID",
+            "SPLUNK_OAUTH_SCOPE",
         ] {
             // Safety: テスト内でのみ使う。
             unsafe {
@@ -851,5 +891,74 @@ format = "json"
         let r = format!("{:?}", basic);
         assert!(!r.contains("LEAKED_PASSWORD"), "password leak: {}", r);
         assert!(r.contains("alice"), "username should be visible: {}", r);
+    }
+
+    #[test]
+    fn oauth_resolution_preserves_provenance_and_refuses_unsafe_fallback() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_splunk_env();
+        let store = MemoryStore::new();
+        let mut settings = Settings {
+            base_url: Some("https://example.invalid".into()),
+            oauth_tenant_id: Some("tenant".into()),
+            oauth_client_id: Some("client".into()),
+            session_key: Some("dummy-fallback-session".into()),
+            username: Some("dummy-user".into()),
+            password: Some("dummy-password".into()),
+            ..Settings::default()
+        };
+        let cfg = resolve_oauth_config(&settings).unwrap();
+        let session = crate::oauth::OAuthSession::from_login(
+            &crate::oauth::TokenSet {
+                access_token: "dummy-entra".into(),
+                refresh_token: None,
+                expires_at: u64::MAX,
+            },
+            &crate::oauth::SplunkToken {
+                access_token: "dummy-splunk".into(),
+                expires_at: u64::MAX,
+            },
+            &cfg,
+            "https://example.invalid",
+        )
+        .unwrap();
+        store
+            .set(KEY_OAUTH_SESSION, &session.to_json().unwrap())
+            .unwrap();
+        let creds = resolve_credentials_with_store(None, None, &settings, Some(&store)).unwrap();
+        assert!(creds.oauth.is_some());
+
+        // A manually stored value must stay manual, even when equal to OAuth.
+        store.set(KEY_TOKEN, "dummy-splunk").unwrap();
+        let creds = resolve_credentials_with_store(None, None, &settings, Some(&store)).unwrap();
+        assert!(creds.oauth.is_none());
+        store.delete(KEY_TOKEN).unwrap();
+
+        settings.base_url = Some("https://other.invalid".into());
+        assert!(resolve_credentials_with_store(None, None, &settings, Some(&store)).is_err());
+        settings.base_url = Some("https://example.invalid".into());
+        for raw in [
+            "{dummy-secret",
+            &session
+                .to_json()
+                .unwrap()
+                .replace("\"version\":1", "\"version\":99"),
+        ] {
+            store.set(KEY_OAUTH_SESSION, raw).unwrap();
+            let error =
+                resolve_credentials_with_store(None, None, &settings, Some(&store)).unwrap_err();
+            assert!(!error.to_string().contains("dummy-secret"));
+        }
+        let mut legacy = session;
+        legacy.binding = None;
+        store
+            .set(KEY_OAUTH_SESSION, &legacy.to_json().unwrap())
+            .unwrap();
+        assert!(resolve_credentials_with_store(None, None, &settings, Some(&store)).is_err());
+
+        // Explicit manual Bearer selection remains independent of legacy OAuth.
+        settings.token = Some("manual-dummy".into());
+        let creds = resolve_credentials_with_store(None, None, &settings, Some(&store)).unwrap();
+        assert!(creds.oauth.is_none());
     }
 }

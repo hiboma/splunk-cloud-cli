@@ -20,7 +20,7 @@ pub enum OutputFormat {
     long_about = "CLI for Splunk Cloud Platform REST API (Victoria Experience).\n\n\
 Credentials are never accepted via command-line flags (which would leak through shell history and `ps`).\n\
 They come from environment variables OR the config file at:\n\
-  ./.splunk-cloud-cli.toml\n\
+  --config PATH (explicit selection, including project-local files)\n\
   $XDG_CONFIG_HOME/splunk-cloud-cli/config.toml  (default: ~/.config/splunk-cloud-cli/config.toml)\n\n\
 Secrets (token / session_key / password) can also live in the OS credential store\n\
 (macOS Keychain). Priority: env var > credential store > config file.\n\
@@ -35,6 +35,10 @@ Environment variables always override the config file:\n\
   SPLUNK_USER            optional, default: nobody"
 )]
 pub struct Cli {
+    /// Read this configuration file instead of the user config. Project-local files require this flag.
+    #[arg(long, value_name = "PATH", global = true)]
+    pub config: Option<std::path::PathBuf>,
+
     /// Default app for `servicesNS/{user}/{app}/...` paths (default: "search").
     /// Use `-` as a wildcard to search across all apps (e.g. `--app -`).
     /// Env: SPLUNK_APP.

@@ -2,7 +2,7 @@ use clap::{CommandFactory, Parser};
 use splunk_cloud_cli::cli::{AuthCmd, Cli, Command, OutputFormat};
 use splunk_cloud_cli::client::SplunkClient;
 use splunk_cloud_cli::commands;
-use splunk_cloud_cli::config::{load_settings, resolve_credentials};
+use splunk_cloud_cli::config::{load_settings_from, resolve_credentials};
 use splunk_cloud_cli::error::{Result, SplunkError};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -51,13 +51,15 @@ async fn run(cli: Cli) -> Result<()> {
             return Ok(());
         }
         Command::Credentials(c) => {
-            return commands::credentials::run(c);
+            return commands::credentials::run_with_config(c, cli.config.as_deref());
         }
         Command::Doctor { no_connect, strict } => {
             // doctor は接続情報の解決を自前で診断するため、共通の
             // resolve_credentials / client 構築を経由しない。`--strict` で
             // 問題が見つかった場合は非ゼロ終了させる。
-            let healthy = commands::doctor::run(*no_connect, *strict).await?;
+            let healthy =
+                commands::doctor::run_with_config(*no_connect, *strict, cli.config.as_deref())
+                    .await?;
             if !healthy {
                 std::process::exit(1);
             }
@@ -66,7 +68,7 @@ async fn run(cli: Cli) -> Result<()> {
         _ => {}
     }
 
-    let settings = load_settings()?;
+    let settings = load_settings_from(cli.config.as_deref())?;
 
     // `auth login` / `logout` / `status` は Splunk への接続を必要としない
     // （認証情報の取得・破棄・確認そのものが目的）。client を組む前に処理する。

@@ -1,6 +1,7 @@
 use crate::auth::Authorizer;
 use crate::config::Credentials;
 use crate::error::{Result, SplunkError};
+use crate::transport::{Endpoint, HttpClient};
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
 
@@ -14,7 +15,7 @@ use serde_json::Value;
 /// うっかり `{:?}` / `dbg!` で漏洩する経路を潰す。
 #[derive(Clone)]
 pub struct SplunkClient {
-    http: reqwest::Client,
+    http: HttpClient,
     base_url: String,
     auth: Authorizer,
     pub default_app: String,
@@ -28,16 +29,8 @@ impl SplunkClient {
     }
 
     pub fn new_with_debug(creds: Credentials, debug: bool) -> Result<Self> {
-        let base_url = creds.base_url.clone();
-        if !base_url.starts_with("https://") && !Self::is_loopback_http(&base_url) {
-            return Err(SplunkError::Config(format!(
-                "base_url must use HTTPS (got: {}). HTTP is only allowed for localhost and 127.0.0.1.",
-                base_url
-            )));
-        }
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("splunk-cloud-cli/", env!("CARGO_PKG_VERSION")))
-            .build()?;
+        let base_url = Endpoint::parse(&creds.base_url)?.origin();
+        let http = HttpClient::new()?;
         let auth = Authorizer::new(&creds, http.clone());
         Ok(Self {
             http,
@@ -64,18 +57,6 @@ impl SplunkClient {
     /// リソース名を URL エンコードする。`name` には `/` を含めないことを仮定する。
     pub fn encode(name: &str) -> String {
         urlencoding::encode(name).into_owned()
-    }
-
-    /// `http://localhost` / `http://127.0.0.1` のみ許容する判定。
-    fn is_loopback_http(url: &str) -> bool {
-        for prefix in &["http://localhost", "http://127.0.0.1"] {
-            if let Some(rest) = url.strip_prefix(prefix) {
-                if rest.is_empty() || rest.starts_with(':') || rest.starts_with('/') {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     /// GET を JSON で返す。
@@ -107,7 +88,7 @@ impl SplunkClient {
     }
 
     /// POST application/x-www-form-urlencoded。
-    /// 4xx でも JSON ボディが取れれば `(status, value)` を返す。
+    /// 401/403 以外の 4xx でも JSON ボディが取れれば `(status, value)` を返す。
     /// 5xx・タイムアウト・JSON パース失敗は通常通り `Err` を返す。
     /// 構文エラーでも `messages[]` を返す `/services/search/parser` のような
     /// エンドポイントを呼び出すために使う。
@@ -209,6 +190,7 @@ impl SplunkClient {
         };
 
         let status = resp.status();
+        reject_auth_failure(status)?;
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             let body = crate::util::truncate_chars(&body, 500);
@@ -254,6 +236,20 @@ impl SplunkClient {
         body: Option<Body>,
         is_retry: bool,
     ) -> Result<reqwest::Response> {
+        // Validate before acquiring credentials: even Basic login must not run
+        // when a caller supplies a path that changes the request authority.
+        let invalid_target = || {
+            SplunkError::Config(
+                "request path must stay within the configured service origin".into(),
+            )
+        };
+        let target = reqwest::Url::parse(url).map_err(|_| invalid_target())?;
+        if target.origin().ascii_serialization() != self.base_url
+            || !target.username().is_empty()
+            || target.password().is_some()
+        {
+            return Err(invalid_target());
+        }
         let mut query: Vec<(String, String)> = query
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -365,6 +361,9 @@ impl SplunkClient {
     /// `self.debug` 有効時はステータス・ヘッダ・本文プレビューを stderr に出す。
     async fn drain_response(&self, resp: reqwest::Response) -> Result<(StatusCode, String)> {
         let status = resp.status();
+        // Authentication responses may reflect credentials in both body and
+        // headers. Reject before reading or logging either, including --debug.
+        reject_auth_failure(status)?;
         let headers = resp.headers().clone();
         let text = resp.text().await?;
         if self.debug {
@@ -395,8 +394,21 @@ fn preview_body(text: &str, limit: usize) -> String {
 /// 非 2xx 応答を `SplunkError::Api` に変換する共通ヘルパ。
 /// 本文は 500 バイトで打ち切る。
 fn api_error(status: StatusCode, text: &str) -> SplunkError {
+    if let Err(error) = reject_auth_failure(status) {
+        return error;
+    }
     let truncated = if text.len() > 500 { &text[..500] } else { text };
     SplunkError::Api(format!("{}: {}", status, truncated))
+}
+
+fn reject_auth_failure(status: StatusCode) -> Result<()> {
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return Err(SplunkError::Api(format!(
+            "{}: authentication or authorization failed",
+            status
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -408,6 +420,7 @@ enum Body {
 #[allow(dead_code)]
 async fn handle_bytes(resp: reqwest::Response) -> Result<Vec<u8>> {
     let status = resp.status();
+    reject_auth_failure(status)?;
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         let body = crate::util::truncate_chars(&body, 500);
