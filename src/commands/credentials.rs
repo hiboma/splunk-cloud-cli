@@ -132,23 +132,53 @@ fn migrate_with_prompts(
 
     let original = fs::read_to_string(&path)
         .map_err(|e| SplunkError::Config(format!("failed to read {}: {}", path.display(), e)))?;
-    parse_settings(&original, &path)?;
+    let settings = parse_settings(&original, &path)?;
+    let unsupported = || {
+        SplunkError::Config(
+            "unsupported credential representation; refusing to rewrite config".to_string(),
+        )
+    };
+    // The line-preserving editor must agree with TOML semantics before any
+    // prompts or writes, including for quoted keys and nested/multiline values.
+    let toml_keys = ["token", "session_key", "password"];
+    let updated = remove_fields(&original, &toml_keys);
+    let mut expected: toml::Value = toml::from_str(&original).map_err(|_| unsupported())?;
+    let table = expected.as_table_mut().ok_or_else(unsupported)?;
+    for key in toml_keys {
+        table.remove(key);
+    }
+    let actual: toml::Value = toml::from_str(&updated).map_err(|_| unsupported())?;
+    // Canonical TOML also compares unchanged NaN values consistently; direct
+    // Value equality inherits IEEE NaN != NaN, including in nested structures.
+    if actual.to_string() != expected.to_string() {
+        return Err(unsupported());
+    }
 
     // 3 フィールドを一括で走査する。`Unsupported` はフィールドごとに即座にエラーにして、
     // 「片方だけ成功して片方は壊れた toml を残す」ような中途半端を避ける。
     let targets = [
-        (KEY_TOKEN, "token"),
-        (KEY_SESSION_KEY, "session_key"),
-        (KEY_PASSWORD, "password"),
+        (KEY_TOKEN, "token", settings.token.as_deref()),
+        (
+            KEY_SESSION_KEY,
+            "session_key",
+            settings.session_key.as_deref(),
+        ),
+        (KEY_PASSWORD, "password", settings.password.as_deref()),
     ];
     let mut present: Vec<(&'static str, String)> = Vec::new();
-    for (store_key, toml_key) in targets {
+    for (store_key, toml_key, parsed) in targets {
         match extract_field(&original, toml_key) {
             FieldScan::Present(v) => {
+                if parsed != Some(v.as_str()) {
+                    return Err(unsupported());
+                }
                 println!("  {}: present (will move to credential store)", toml_key);
                 present.push((store_key, v));
             }
             FieldScan::Absent => {
+                if parsed.is_some_and(|value| !value.is_empty()) {
+                    return Err(unsupported());
+                }
                 println!("  {}: not present (skip)", toml_key);
             }
             FieldScan::Unsupported(form) => {
@@ -207,9 +237,7 @@ fn migrate_with_prompts(
     // 空文字宣言行を残すと「秘密情報はどこにも書いてないはずなのに宣言だけ残る」
     // という誤解を招き、`credentials status` との整合も崩れる。migrate の契約は
     // 「config.toml からすべての秘密フィールドを除去する」と一貫させる。
-    let toml_keys: [&str; 3] = ["token", "session_key", "password"];
     let mode = disposal()?;
-    let updated = remove_fields(&original, &toml_keys);
 
     match mode {
         DisposalMode::Remove => {
@@ -525,6 +553,114 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[test]
+    fn migrate_rejects_parser_disagreements_without_side_effects() {
+        let mut inputs = Vec::new();
+        for key in ["token", "session_key", "password"] {
+            for quoted in [
+                format!("\"{key}\""),
+                format!("'{key}'"),
+                format!("\"\\u{:04x}{}\"", key.as_bytes()[0], &key[1..]),
+            ] {
+                inputs.push(format!("{quoted} = \"dummy-secret\"\n"));
+                let other = if key == "password" {
+                    "token"
+                } else {
+                    "password"
+                };
+                inputs.push(format!("{quoted} = \"\"\n{other} = \"dummy-secret\"\n"));
+            }
+        }
+        inputs.extend([
+            "token = \"a\\nb\"\n".to_string(),
+            "token = \"a\\\\b\"\n".to_string(),
+            "token = \"\\u0061\"\n".to_string(),
+            "[extra]\ntoken = \"dummy-secret\"\n".to_string(),
+            "token = \"dummy-secret\"\n[extra]\ntoken = \"dummy-secret\"\n".to_string(),
+            "note = '''\ntoken = \"dummy-secret\"\n'''\npassword = \"dummy-secret\"\n".to_string(),
+        ]);
+        for original in inputs {
+            for dry_run in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("config.toml");
+                fs::write(&path, &original).unwrap();
+                let store = MemoryStore::new();
+                for key in [KEY_TOKEN, KEY_SESSION_KEY, KEY_PASSWORD] {
+                    store.set(key, "existing-value").unwrap();
+                }
+                let error = migrate_with_prompts(
+                    &store,
+                    dry_run,
+                    Some(&path),
+                    |_, _| panic!("must reject before confirmation"),
+                    || panic!("must reject before disposal"),
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("refusing to rewrite"));
+                assert!(!format!("{error:?}").contains("dummy-secret"));
+                assert_eq!(fs::read_to_string(&path).unwrap(), original);
+                assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+                for key in [KEY_TOKEN, KEY_SESSION_KEY, KEY_PASSWORD] {
+                    assert_eq!(store.get(key).unwrap().as_deref(), Some("existing-value"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn migrate_preserves_nan_settings() {
+        for value in [
+            "nan",
+            "+nan",
+            "-nan",
+            "[nan, +nan, -nan]",
+            "{ nested = nan }",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let remainder = format!("extra = {value}\n");
+            fs::write(&path, format!("token = \"dummy-token\"\n{remainder}")).unwrap();
+            let store = MemoryStore::new();
+            migrate_with_prompts(
+                &store,
+                false,
+                Some(&path),
+                |_, _| Ok(true),
+                || Ok(DisposalMode::Remove),
+            )
+            .unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), remainder);
+            assert_eq!(
+                store.get(KEY_TOKEN).unwrap().as_deref(),
+                Some("dummy-token")
+            );
+        }
+    }
+
+    #[test]
+    fn migrate_preserves_non_secret_settings_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "# keep\nbase_url = \"https://example.test\"\ntoken = \"dummy-token\" # removed\nsession_key = \"\"\n[extra]\nnote = 'keep'\n").unwrap();
+        let store = MemoryStore::new();
+        migrate_with_prompts(
+            &store,
+            false,
+            Some(&path),
+            |_, _| Ok(true),
+            || Ok(DisposalMode::Remove),
+        )
+        .unwrap();
+        assert_eq!(
+            store.get(KEY_TOKEN).unwrap().as_deref(),
+            Some("dummy-token")
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# keep\nbase_url = \"https://example.test\"\n[extra]\nnote = 'keep'\n"
+        );
     }
 
     #[test]
