@@ -155,7 +155,7 @@ impl Authorizer {
                 // refresh token ローテーション時の喪失を防ぐ）。
                 if let Some(partial) = e.partial {
                     persist_session(state.store.as_ref(), &partial);
-                    state.session = partial;
+                    state.session = *partial;
                 }
                 Err(e.error)
             }

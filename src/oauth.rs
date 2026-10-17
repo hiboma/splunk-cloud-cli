@@ -894,7 +894,7 @@ Run `auth login` again."
                 // 中間セッションをエラーに添えて返す（呼び出し側が保存できる）。
                 return Err(RefreshErr {
                     error: e,
-                    partial: entra_refreshed.then_some(next),
+                    partial: entra_refreshed.then(|| Box::new(next)),
                 });
             }
         };
@@ -912,7 +912,7 @@ Run `auth login` again."
 /// 呼び出し側は `partial` を store に書き戻してから `error` を伝播してよい。
 pub struct RefreshErr {
     pub error: SplunkError,
-    pub partial: Option<OAuthSession>,
+    pub partial: Option<Box<OAuthSession>>,
 }
 
 /// Entra ID の access token (JWT) を Splunk access token に交換する。
