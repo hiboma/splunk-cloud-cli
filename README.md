@@ -52,11 +52,21 @@ The formula template lives at `packaging/homebrew/splunk-cloud-cli.rb`. Release 
 
 All settings — including the stack URL and credentials — can live in a TOML file, but environment variables always win when present. Credentials are never accepted via command-line flags (which would leak through shell history and `ps`).
 
-Config file search order (first hit wins):
+By default, the CLI reads `$XDG_CONFIG_HOME/splunk-cloud-cli/config.toml`, or
+`~/.config/splunk-cloud-cli/config.toml` when `XDG_CONFIG_HOME` is unset or empty.
+A nonempty `XDG_CONFIG_HOME` must be an absolute path.
+It does not automatically read configuration from the current directory.
+Use `--config PATH` to explicitly select a trusted file; a missing or invalid
+explicit file is an error, with no fallback to another file. This also applies
+to `doctor` and `credentials migrate`.
 
-1. `./.splunk-cloud-cli.toml`
-2. `$XDG_CONFIG_HOME/splunk-cloud-cli/config.toml`
-3. `~/.config/splunk-cloud-cli/config.toml`
+Selecting a configuration file trusts its destination with your credentials.
+For an existing project configuration, use
+`splunk-cloud-cli --config ./.splunk-cloud-cli.toml auth whoami` after reviewing it.
+`base_url` must be an HTTPS origin (optional port and trailing slash), without
+userinfo, path, query, or fragment. HTTP is allowed only for loopback testing
+on `localhost`, `127.0.0.1`, or `[::1]`. Authenticated requests do not follow
+redirects; configure the final service origin directly.
 
 ### Full TOML example
 
@@ -155,7 +165,7 @@ To move any existing `token` / `session_key` / `password` out of `config.toml` a
 splunk-cloud-cli credentials migrate
 ```
 
-`migrate` is transactional: it writes to the Keychain first, then atomically rewrites `config.toml` (0600). If the rewrite fails, the Keychain entries it just wrote are rolled back so the user is never left in an inconsistent half-migrated state. Unsupported TOML quoting forms (literal strings, multi-line basic/literal, escaped quotes) are refused rather than silently mishandled.
+`migrate` writes to the Keychain first, then atomically rewrites `config.toml` (0600). If the rewrite fails, it attempts to delete the Keychain entries written by that migration. Unsupported TOML representations (including quoted credential keys, literal/multiline values, and escaped credential values) are refused before writing. The migration also verifies that the rewrite removes only top-level credential fields and preserves other parsed settings. Use unquoted keys and plain double-quoted values, or store credentials directly with `credentials set`.
 
 By default, `migrate` removes the plaintext lines from `config.toml` outright. Choosing to keep a 0600 backup is supported but warned about — any copy left on disk re-introduces the risk we just migrated away from.
 
@@ -195,7 +205,7 @@ Instead of pasting a long-lived token, you can sign in interactively against Mic
 
 Splunk Cloud does **not** accept the Entra ID JWT directly on the REST API — it issues its own tokens. So after sign-in, the CLI exchanges the Entra JWT for a Splunk access token via the Splunk token endpoint (`oauth2/v1/token`, using the JWT as a `client_assertion`), and stores that Splunk token. Subsequent REST calls send the Splunk token as a Bearer token.
 
-`auth login` needs to open a browser and bind the loopback port, so it is intended for an interactive desktop session (macOS / Windows). If a browser cannot be opened it prints the URL to open manually, but the loopback redirect must still reach the CLI.
+`auth login` requires macOS Keychain, a browser, and the loopback port. If a browser cannot be opened it prints the URL to open manually, but the loopback redirect must still reach the CLI.
 
 This requires an Entra ID app registration with a public client, and a matching OAuth 2.0 configuration on the Splunk Cloud side. On the app registration, add `http://127.0.0.1:49873/callback` as a redirect URI under **Mobile and desktop applications** (Entra matches redirect URIs exactly, which is why the port is fixed). Put the (non-secret) tenant and client identifiers in the config file:
 
@@ -203,9 +213,9 @@ This requires an Entra ID app registration with a public client, and a matching 
 base_url        = "https://prd-p-xxxxxx.splunkcloud.com:8089"
 
 # Entra ID OAuth (used by `auth login`)
-oauth_tenant_id = "a271068e-1b87-40f0-a7f2-f9c9624e3f7c"
-oauth_client_id = "325df464-153b-4bc5-adac-7e5014b58bb4"
-# oauth_scope   = "api://325df464-153b-4bc5-adac-7e5014b58bb4/user_impersonation"
+oauth_tenant_id = "00000000-0000-0000-0000-000000000001"
+oauth_client_id = "00000000-0000-0000-0000-000000000002"
+# oauth_scope   = "api://00000000-0000-0000-0000-000000000002/user_impersonation"
 # ^ optional; defaults to api://<client_id>/user_impersonation. `offline_access` is always added.
 ```
 
@@ -238,10 +248,23 @@ Storage layout in the credential store (`service=dev.splunk-cloud-cli`):
 
 | Account | Contents |
 |---|---|
-| `oauth_session` | A single JSON entry holding the Splunk token, Entra access token, Entra refresh token, and both expiries |
+| `oauth_session` | A single JSON entry holding tokens, expiries, and a versioned binding to the Splunk origin, Entra tenant, client, and requested scopes |
 | `token` | Reserved for a manually-set Bearer token (`credentials set token`); not used by `auth login` |
 
-The five OAuth values are kept in **one** `oauth_session` entry rather than separate keys, so macOS only shows the Keychain access prompt once instead of per value. Credential resolution order: `SPLUNK_TOKEN` env var → OAuth session (`auth login`) → manual `token` → `session_key` → Basic auth. An explicit `SPLUNK_TOKEN` is treated as a fixed value and disables automatic refresh.
+OAuth values are kept in **one** `oauth_session` entry rather than separate keys. Credential resolution order: manual `token` (env → credential store → TOML) → OAuth session (`auth login`) → `session_key` → Basic auth. Manual tokens are fixed values and disable automatic refresh, even if their value equals a saved OAuth token.
+
+After upgrading from an unbound session format, run `auth login` again with
+trusted configuration. Sessions are not automatically reassigned to the
+current destination. A changed origin, tenant, client, or requested scope also
+requires a new login; an unusable selected OAuth session does not fall back to
+session-key or Basic authentication. `auth status` and `auth logout` can still
+inspect or remove legacy sessions. Logout removes local state only; it does not
+revoke tokens at the server. If exposure is suspected, revoke or replace the
+affected credentials using your identity provider and Splunk administration.
+
+Authentication failures show HTTP status and recognized error codes, not server
+response text. Configuration parse errors show file location without input
+snippets. These diagnostics intentionally omit potentially sensitive content.
 
 ### Example: direnv `.envrc`
 
@@ -440,7 +463,7 @@ cargo test
 cargo build --release
 ```
 
-Integration tests use `mockito` against loopback HTTP. Production connections enforce `https://` (`localhost` / `127.0.0.1` are the only HTTP exceptions).
+Integration tests use `mockito` against loopback HTTP. Production connections enforce `https://` (`localhost` / `127.0.0.1` / `[::1]` are the only HTTP exceptions).
 
 ## Coverage
 
